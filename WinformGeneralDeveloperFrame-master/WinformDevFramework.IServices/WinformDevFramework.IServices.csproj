@@ -1,0 +1,41 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Remove="Buy\**" />
+    <Compile Remove="Finance\**" />
+    <Compile Remove="Sale\**" />
+    <Compile Remove="Warehouses\**" />
+    <EmbeddedResource Remove="Buy\**" />
+    <EmbeddedResource Remove="Finance\**" />
+    <EmbeddedResource Remove="Sale\**" />
+    <EmbeddedResource Remove="Warehouses\**" />
+    <None Remove="Buy\**" />
+    <None Remove="Finance\**" />
+    <None Remove="Sale\**" />
+    <None Remove="Warehouses\**" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Remove="Basic\IW_CustomerServices.cs" />
+    <Compile Remove="Basic\IW_GoodsServices.cs" />
+    <Compile Remove="Basic\IW_SettlementAccountServices.cs" />
+    <Compile Remove="Basic\IW_SupplierServices.cs" />
+    <Compile Remove="Basic\IW_WarehoursesServices.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="HslCommunication" Version="7.0.1" />
+    <PackageReference Include="SqlSugarCore" Version="5.1.4.95" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\WinformDevFramework.Models\WinformDevFramework.Models.csproj" />
+  </ItemGroup>
+
+</Project>

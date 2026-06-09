@@ -1,0 +1,54 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Remove="DBModels\w_Buy.cs" />
+    <Compile Remove="DBModels\w_BuyDetail.cs" />
+    <Compile Remove="DBModels\w_BuyInWarehouses.cs" />
+    <Compile Remove="DBModels\w_BuyInWarehousesDetail.cs" />
+    <Compile Remove="DBModels\w_BuyReturn.cs" />
+    <Compile Remove="DBModels\w_BuyReturnDetail.cs" />
+    <Compile Remove="DBModels\w_BuyReturnOutWarehouses.cs" />
+    <Compile Remove="DBModels\w_BuyReturnOutWarehousesDetail.cs" />
+    <Compile Remove="DBModels\w_Customer.cs" />
+    <Compile Remove="DBModels\W_Goods.cs" />
+    <Compile Remove="DBModels\w_HandlerManger.cs" />
+    <Compile Remove="DBModels\w_OtherIncome.cs" />
+    <Compile Remove="DBModels\w_OtherInWarehouses.cs" />
+    <Compile Remove="DBModels\w_OtherInWarehousesDetail.cs" />
+    <Compile Remove="DBModels\w_OtherOutlay.cs" />
+    <Compile Remove="DBModels\w_OtherOutWarehouses.cs" />
+    <Compile Remove="DBModels\w_OtherOutWarehousesDetail.cs" />
+    <Compile Remove="DBModels\w_Payment.cs" />
+    <Compile Remove="DBModels\w_PaymentDetail.cs" />
+    <Compile Remove="DBModels\w_Project.cs" />
+    <Compile Remove="DBModels\w_Receivable.cs" />
+    <Compile Remove="DBModels\w_ReceivableDetail.cs" />
+    <Compile Remove="DBModels\w_Sale.cs" />
+    <Compile Remove="DBModels\w_SaleDetail.cs" />
+    <Compile Remove="DBModels\w_SaleOutWarehouse.cs" />
+    <Compile Remove="DBModels\w_SaleOutWarehouseDetail.cs" />
+    <Compile Remove="DBModels\w_SaleReturn.cs" />
+    <Compile Remove="DBModels\w_SaleReturnDetail.cs" />
+    <Compile Remove="DBModels\w_SaleReturnInWarehouse.cs" />
+    <Compile Remove="DBModels\w_SaleReturnInWarehouseDetail.cs" />
+    <Compile Remove="DBModels\w_SettlementAccount.cs" />
+    <Compile Remove="DBModels\w_Supplier.cs" />
+    <Compile Remove="DBModels\w_Warehouse.cs" />
+    <Compile Remove="PLCBasic\PLC_ParameterDistributionCurrent.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="SqlSugarCore" Version="5.1.4.95" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\WinformDevFramework.Core\WinformDevFramework.Core.csproj" />
+  </ItemGroup>
+
+</Project>

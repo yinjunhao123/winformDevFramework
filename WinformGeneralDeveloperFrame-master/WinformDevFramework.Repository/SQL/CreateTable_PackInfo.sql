@@ -1,0 +1,61 @@
+-- 创建包装主表
+CREATE TABLE [dbo].[PackInfo](
+    [ID] [bigint] IDENTITY(1,1) NOT NULL,
+    [PackBarcode] [nvarchar](100) NOT NULL,
+    [ProductModel] [nvarchar](50) NOT NULL,
+    [RecipeCode] [nvarchar](50) NOT NULL,
+    [Maxqty] [int] NOT NULL,
+    [Haveqty] [int] NOT NULL DEFAULT 0,
+    [Unqty] [int] NOT NULL DEFAULT 0,
+    [CreateTime] [datetime] NOT NULL DEFAULT GETDATE(),
+    [CreateUser] [nvarchar](50) NOT NULL,
+    [UpdateTime] [datetime] NULL,
+    [UpdateUser] [nvarchar](50) NULL,
+ CONSTRAINT [PK_PackInfo] PRIMARY KEY CLUSTERED 
+(
+    [ID] ASC
+)WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON, OPTIMIZE_FOR_SEQUENTIAL_KEY = OFF) ON [PRIMARY],
+ CONSTRAINT [UK_PackInfo_PackBarcode] UNIQUE NONCLUSTERED 
+(
+    [PackBarcode] ASC
+)WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON, OPTIMIZE_FOR_SEQUENTIAL_KEY = OFF) ON [PRIMARY]
+) ON [PRIMARY]
+GO
+
+-- 创建包装明细表
+CREATE TABLE [dbo].[PackInfoDetail](
+    [ID] [bigint] IDENTITY(1,1) NOT NULL,
+    [PackInfoId] [bigint] NOT NULL,
+    [BarCode] [nvarchar](100) NOT NULL,
+    [ProductModel] [nvarchar](50) NOT NULL,
+    [RecipeCode] [nvarchar](50) NOT NULL,
+    [CreateTime] [datetime] NOT NULL DEFAULT GETDATE(),
+    [CreateUser] [nvarchar](50) NOT NULL,
+ CONSTRAINT [PK_PackInfoDetail] PRIMARY KEY CLUSTERED 
+(
+    [ID] ASC
+)WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON, OPTIMIZE_FOR_SEQUENTIAL_KEY = OFF) ON [PRIMARY]
+) ON [PRIMARY]
+GO
+
+-- 添加外键约束
+ALTER TABLE [dbo].[PackInfoDetail]  WITH CHECK ADD  CONSTRAINT [FK_PackInfoDetail_PackInfo] FOREIGN KEY([PackInfoId])
+REFERENCES [dbo].[PackInfo] ([ID])
+ON DELETE CASCADE
+GO
+
+ALTER TABLE [dbo].[PackInfoDetail] CHECK CONSTRAINT [FK_PackInfoDetail_PackInfo]
+GO
+
+-- 创建索引
+CREATE NONCLUSTERED INDEX [IX_PackInfoDetail_PackInfoId] ON [dbo].[PackInfoDetail]
+(
+    [PackInfoId] ASC
+)WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, SORT_IN_TEMPDB = OFF, DROP_EXISTING = OFF, ONLINE = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON, OPTIMIZE_FOR_SEQUENTIAL_KEY = OFF) ON [PRIMARY]
+GO
+
+CREATE NONCLUSTERED INDEX [IX_PackInfoDetail_BarCode] ON [dbo].[PackInfoDetail]
+(
+    [BarCode] ASC
+)WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, SORT_IN_TEMPDB = OFF, DROP_EXISTING = OFF, ONLINE = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON, OPTIMIZE_FOR_SEQUENTIAL_KEY = OFF) ON [PRIMARY]
+GO

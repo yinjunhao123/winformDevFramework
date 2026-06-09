@@ -1,0 +1,48 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Remove="Buy\**" />
+    <Compile Remove="Sale\**" />
+    <Compile Remove="Warehouses\**" />
+    <EmbeddedResource Remove="Buy\**" />
+    <EmbeddedResource Remove="Sale\**" />
+    <EmbeddedResource Remove="Warehouses\**" />
+    <None Remove="Buy\**" />
+    <None Remove="Sale\**" />
+    <None Remove="Warehouses\**" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Remove="Basic\W_CustomerRepository.cs" />
+    <Compile Remove="Basic\W_GoodsRepository.cs" />
+    <Compile Remove="Basic\W_SettlementAccountRepository.cs" />
+    <Compile Remove="Basic\W_SupplierRepository.cs" />
+    <Compile Remove="Basic\W_WarehoursesRepository.cs" />
+    <Compile Remove="Finance\W_OtherIncomeRepository.cs" />
+    <Compile Remove="Finance\W_OtherOutlayRepository.cs" />
+    <Compile Remove="Finance\W_PaymentDetailRepository.cs" />
+    <Compile Remove="Finance\W_PaymentRepository.cs" />
+    <Compile Remove="Finance\W_ReceivableDetailRepository.cs" />
+    <Compile Remove="Finance\W_ReceivableRepository.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="SqlSugar.IOC" Version="2.0.0" />
+    <PackageReference Include="SqlSugarCore" Version="5.1.4.95" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\WinformDevFramework.IRepository\WinformDevFramework.IRepository.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Folder Include="Finance\" />
+  </ItemGroup>
+
+</Project>

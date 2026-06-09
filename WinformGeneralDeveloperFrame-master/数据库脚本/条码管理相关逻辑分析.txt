@@ -1,0 +1,9 @@
+1.新建WipBarcode表（过站成功才更新表）
+  表字段
+  BarCodeId  BarCode  ModelCode  PrStationCode(上一工站)  StationCode NextStationCode(下一工站) OutputTime(过站时间)，CreateUser,CreateTime,UpdateUser,UpdateTime
+  2.在建立WipBarcodeHistory表（过站成功，会把之前Wip数据新增到该表中）
+  表字段差不多
+  3.在建立表 BarCodePart  条码绑定零件表（根据工艺路线，根据工艺路线，哪个站点需要采集零件，如果采集不完整，不允许过站）
+ barcode ,ModelCode,StationCode(当前站点), MainPartCode(零主件)，FirstPartCode(第一零件子健)，SecondCode(第二零件子健),ThirdCode(第三零件子健) ,CreateUser,CreateTime,UpdateUser,UpdateTime
+  4.在建立条码过站参数采集表中添加BarCode字段
+ 

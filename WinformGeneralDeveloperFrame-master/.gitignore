@@ -1,0 +1,47 @@
+# 忽略编译生成的文件
+bin/
+obj/
+
+# 忽略 NuGet 包文件夹
+packages/
+
+# 忽略 Visual Studio 的一些文件和文件夹
+.vs/
+.vscode/
+*.suo
+*.user
+*.userprefs
+*.bak
+*.cache
+*.log
+*.vspscc
+*.vssscc
+*_i.c
+*_p.c
+*.ncb
+*.sdf
+*.opensdf
+*.sln.docstates
+
+# 忽略 ReSharper 缓存和临时文件
+_ReSharper*/
+*.resharper*
+*.DotSettings.user
+
+# 忽略自动生成的文件
+[Tt]est[Rr]esult*/
+[Bb]uild[Ll]og.*
+*.[Pp]ublish.xml
+*.publishproj
+*.pubxml
+*.publishsettings
+
+# 忽略 Web 缓存文件
+*.dbmdl
+*.jfm
+*.sdf
+*.mdf
+*.ldf
+*.bak
+*.cache
+*.csproj.user
