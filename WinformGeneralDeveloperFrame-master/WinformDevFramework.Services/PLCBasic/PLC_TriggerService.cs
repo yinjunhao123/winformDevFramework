@@ -66,6 +66,7 @@ namespace WinformDevFramework.Services.PLCBasic
 
         private Thread _pollingThread;
         private volatile bool _isRunning;
+        private CancellationTokenSource _pollingCancellationToken;
         private int _pollingIntervalMs = 100;
 
         private readonly Dictionary<string, EventTriggerConfig> _eventConfigCache = new Dictionary<string, EventTriggerConfig>();
@@ -102,8 +103,55 @@ namespace WinformDevFramework.Services.PLCBasic
         // Socket通讯服务（用于与外部设备通信，接收图片数据）
         private readonly ISocketCommunicationService _socketCommunicationService;
 
-        // 限流信号量，最多同时处理5个事件
-        private readonly SemaphoreSlim _eventSemaphore = new SemaphoreSlim(5, 10);
+        // 限流信号量，最多同时处理12个事件
+        private readonly SemaphoreSlim _eventSemaphore = new SemaphoreSlim(12, 20);
+
+        // ============ 轮询间隔动态调整 ============
+
+        /// <summary>
+        /// 滑动窗口：记录最近N次的处理时间（毫秒）
+        /// </summary>
+        private readonly Queue<long> _recentProcessingTimes = new Queue<long>();
+
+        /// <summary>
+        /// 滑动窗口大小（保留最近多少次轮询的处理时间）
+        /// </summary>
+        private const int SlidingWindowSize = 20;
+
+        /// <summary>
+        /// 最小轮询间隔（毫秒），防止间隔过小导致CPU占用过高
+        /// </summary>
+        private const int MinPollingIntervalMs = 50;
+
+        /// <summary>
+        /// 最大轮询间隔（毫秒），防止间隔过大导致响应延迟
+        /// </summary>
+        private const int MaxPollingIntervalMs = 500;
+
+        /// <summary>
+        /// 调整阈值：处理时间超过当前间隔的此比例时才触发调整
+        /// </summary>
+        private const double AdjustmentThreshold = 0.7;
+
+        /// <summary>
+        /// 安全余量：目标间隔 = 平均处理时间 × 安全余量
+        /// </summary>
+        private const double SafetyMargin = 1.5;
+
+        /// <summary>
+        /// 调整步长：每次调整的最大变化量（毫秒），防止间隔剧烈波动
+        /// </summary>
+        private const int AdjustmentStepMs = 20;
+
+        /// <summary>
+        /// 上次调整间隔的时间戳，用于防止频繁调整
+        /// </summary>
+        private DateTime _lastAdjustmentTime = DateTime.MinValue;
+
+        /// <summary>
+        /// 调整冷却时间（秒），两次调整之间至少间隔此时间
+        /// </summary>
+        private const int AdjustmentCooldownSeconds = 10;
 
         // ============ 熔断机制（Circuit Breaker） ============
 
@@ -390,9 +438,10 @@ namespace WinformDevFramework.Services.PLCBasic
             if (_isRunning) return;
 
             _isRunning = true;
+            _pollingCancellationToken = new CancellationTokenSource();
             ReloadConfig();
 
-            _pollingThread = new Thread(PollingLoop);
+            _pollingThread = new Thread(async () => await PollingLoop());
             _pollingThread.IsBackground = true;
             _pollingThread.Name = "PLC_Trigger_Polling";
             _pollingThread.Start();
@@ -401,7 +450,10 @@ namespace WinformDevFramework.Services.PLCBasic
         public void Stop()
         {
             _isRunning = false;
+            _pollingCancellationToken?.Cancel();
             _pollingThread?.Join(5000);
+            _pollingCancellationToken?.Dispose();
+            _pollingCancellationToken = null;
         }
 
         public void ReloadConfig()
@@ -513,7 +565,7 @@ namespace WinformDevFramework.Services.PLCBasic
         /// <param name="productModelCode">产品型号编码</param>
         /// <param name="routingCode">工艺路线编码</param>
         /// <param name="createUser">操作人</param>
-        private void UpdateStationRecipeCurrent(string plcCode, string stationCode, string recipeCode,
+        private async Task UpdateStationRecipeCurrent(string plcCode, string stationCode, string recipeCode,
             string productModelCode, string routingCode, string createUser)
         {
             try
@@ -521,8 +573,7 @@ namespace WinformDevFramework.Services.PLCBasic
                 string key = $"{plcCode}_{stationCode}";
 
                 // 先尝试更新现有记录
-                var existing = _stationRecipeCurrentRepository.Query()
-                    .FirstOrDefault(sr => sr.PlcCode == plcCode && sr.StationCode == stationCode);
+                var existing = await _stationRecipeCurrentRepository.QueryByClauseAsync(sr => sr.PlcCode == plcCode && sr.StationCode == stationCode);
 
                 if (existing != null)
                 {
@@ -530,7 +581,7 @@ namespace WinformDevFramework.Services.PLCBasic
                     existing.RecipeCode = recipeCode;
                     existing.ProductModelCode = productModelCode;
                     existing.RoutingCode = routingCode;
-                    _stationRecipeCurrentRepository.Update(existing);
+                    await _stationRecipeCurrentRepository.UpdateAsync(existing);
                     _logger.LogInformation($"更新工站工艺信息: {plcCode}_{stationCode}, Recipe={recipeCode}");
                 }
                 else
@@ -546,7 +597,7 @@ namespace WinformDevFramework.Services.PLCBasic
                         CreateTime = DateTime.Now,
                         CreateUser = createUser
                     };
-                    _stationRecipeCurrentRepository.Insert(newRecord);
+                    await _stationRecipeCurrentRepository.InsertAsync(newRecord);
                     _logger.LogInformation($"创建工站工艺信息: {plcCode}_{stationCode}, Recipe={recipeCode}");
                 }
 
@@ -862,13 +913,13 @@ namespace WinformDevFramework.Services.PLCBasic
 
         #region 私有方法
 
-        private void PollingLoop()
+        private async Task PollingLoop()
         {
             int consecutiveErrorCount = 0;
             long totalPollCount = 0;
             long totalProcessingTime = 0;
 
-            _logger.LogInformation("PLC轮询线程已启动");
+            _logger.LogInformation("PLC轮询线程已启动，初始间隔: {_pollingIntervalMs}ms");
             PerformanceLogger.Log("TriggerService.PollingLoop", "Status", "Started");
             PerformanceLogger.Log("TriggerService.PollingLoop", "PollingIntervalMs", _pollingIntervalMs);
 
@@ -879,30 +930,37 @@ namespace WinformDevFramework.Services.PLCBasic
 
                 try
                 {
-                    // 检查MES模式并执行相应逻辑
-                    CheckAndExecuteByMesModeAsync().Wait(_pollingIntervalMs);
+                    // 检查MES模式并执行相应逻辑（使用await替代.Wait）
+                    using (var cts = CancellationTokenSource.CreateLinkedTokenSource(_pollingCancellationToken.Token))
+                    {
+                        cts.CancelAfter(_pollingIntervalMs);
+                        await CheckAndExecuteByMesModeAsync().WaitAsync(cts.Token);
+                    }
                     
                     consecutiveErrorCount = 0; // 重置错误计数
 
                     pollStopwatch.Stop();
-                    totalProcessingTime += pollStopwatch.ElapsedMilliseconds;
+                    long elapsedMs = pollStopwatch.ElapsedMilliseconds;
+                    totalProcessingTime += elapsedMs;
 
                     // 记录轮询性能指标
                     PerformanceLogger.Log("TriggerService.PollingLoop", "PollCount", totalPollCount);
-                    PerformanceLogger.Log("TriggerService.PollingLoop", "LastPollTimeMs", pollStopwatch.ElapsedMilliseconds);
+                    PerformanceLogger.Log("TriggerService.PollingLoop", "LastPollTimeMs", elapsedMs);
                     PerformanceLogger.Log("TriggerService.PollingLoop", "AveragePollTimeMs", totalProcessingTime / totalPollCount);
 
-                    // 如果处理时间超过轮询间隔的80%，记录警告
-                    if (pollStopwatch.ElapsedMilliseconds > _pollingIntervalMs * 0.8)
-                    {
-                        _logger.LogWarning($"轮询耗时 {pollStopwatch.ElapsedMilliseconds}ms，超过轮询间隔 {_pollingIntervalMs}ms 的80%，可能存在性能问题");
-                    }
+                    // 动态调整轮询间隔
+                    AdjustPollingInterval(elapsedMs);
                 }
                 catch (OperationCanceledException)
                 {
-                    // 任务取消，正常退出
-                    _logger.LogInformation("轮询任务被取消");
-                    break;
+                    if (_pollingCancellationToken?.Token.IsCancellationRequested == true)
+                    {
+                        _logger.LogInformation("轮询任务被取消");
+                        break;
+                    }
+                    // 超时取消，继续下一轮
+                    pollStopwatch.Stop();
+                    _logger.LogDebug($"轮询超时，继续下一轮");
                 }
                 catch (Exception ex)
                 {
@@ -920,12 +978,12 @@ namespace WinformDevFramework.Services.PLCBasic
                     {
                         _logger.LogWarning($"连续错误超过10次，增加轮询间隔");
                         PerformanceLogger.Log("TriggerService.PollingLoop", "IncreasedInterval", true);
-                        Thread.Sleep(_pollingIntervalMs * 5);
+                        await Task.Delay(_pollingIntervalMs * 5);
                         continue;
                     }
                 }
                 
-                Thread.Sleep(_pollingIntervalMs);
+                await Task.Delay(_pollingIntervalMs);
             }
 
             // 记录轮询结束统计
@@ -934,6 +992,82 @@ namespace WinformDevFramework.Services.PLCBasic
             PerformanceLogger.Log("TriggerService.PollingLoop", "TotalProcessingTimeMs", totalProcessingTime);
 
             _logger.LogInformation($"PLC轮询线程已停止，总轮询次数: {totalPollCount}");
+        }
+
+        /// <summary>
+        /// 动态调整轮询间隔
+        /// 根据最近N次的处理时间，自适应调整轮询间隔，避免间隔过小导致CPU占用过高，或间隔过大导致响应延迟
+        /// </summary>
+        /// <param name="lastProcessingTimeMs">上次轮询的处理时间（毫秒）</param>
+        private void AdjustPollingInterval(long lastProcessingTimeMs)
+        {
+            // 1. 将处理时间加入滑动窗口
+            lock (_recentProcessingTimes)
+            {
+                _recentProcessingTimes.Enqueue(lastProcessingTimeMs);
+                // 保持窗口大小
+                while (_recentProcessingTimes.Count > SlidingWindowSize)
+                {
+                    _recentProcessingTimes.Dequeue();
+                }
+
+                // 窗口未满时不调整（需要足够的样本）
+                if (_recentProcessingTimes.Count < SlidingWindowSize / 2)
+                {
+                    return;
+                }
+
+                // 2. 计算平均处理时间
+                double avgProcessingTime = _recentProcessingTimes.Average();
+
+                // 3. 计算目标间隔（平均处理时间 × 安全余量）
+                int targetInterval = (int)Math.Round(avgProcessingTime * SafetyMargin);
+
+                // 4. 限制在最小/最大范围内
+                targetInterval = Math.Max(MinPollingIntervalMs, Math.Min(MaxPollingIntervalMs, targetInterval));
+
+                // 5. 计算与当前间隔的差值
+                int currentInterval = _pollingIntervalMs;
+                int diff = targetInterval - currentInterval;
+
+                // 6. 如果差值很小，不调整（避免频繁微调）
+                if (Math.Abs(diff) < AdjustmentStepMs / 2)
+                {
+                    return;
+                }
+
+                // 7. 检查冷却时间，防止频繁调整
+                if ((DateTime.Now - _lastAdjustmentTime).TotalSeconds < AdjustmentCooldownSeconds)
+                {
+                    return;
+                }
+
+                // 8. 限制单次调整步长，防止剧烈波动
+                if (diff > AdjustmentStepMs)
+                {
+                    diff = AdjustmentStepMs;
+                }
+                else if (diff < -AdjustmentStepMs)
+                {
+                    diff = -AdjustmentStepMs;
+                }
+
+                // 9. 执行调整
+                int newInterval = currentInterval + diff;
+                newInterval = Math.Max(MinPollingIntervalMs, Math.Min(MaxPollingIntervalMs, newInterval));
+
+                if (newInterval != currentInterval)
+                {
+                    _pollingIntervalMs = newInterval;
+                    _lastAdjustmentTime = DateTime.Now;
+
+                    string direction = diff > 0 ? "增大" : "减小";
+                    _logger.LogInformation($"轮询间隔动态调整: {currentInterval}ms → {newInterval}ms ({direction}), " +
+                        $"平均处理时间={avgProcessingTime:F1}ms, 样本数={_recentProcessingTimes.Count}");
+                    PerformanceLogger.Log("TriggerService.PollingLoop", "AdjustedIntervalMs", newInterval);
+                    PerformanceLogger.Log("TriggerService.PollingLoop", "AvgProcessingTimeMs", avgProcessingTime);
+                }
+            }
         }
 
         /// <summary>
@@ -1227,8 +1361,18 @@ namespace WinformDevFramework.Services.PLCBasic
                 string edgeType = isRisingEdge ? "Rising" : "Falling";
                 _logger.LogInformation($"检测到事件触发: EventId={config.EventId}, EventType={config.EventType}, PlcCode={config.PlcCode}, StationCode={config.StationCode}, EdgeType={edgeType}");
 
-                // 异步执行事件处理，不阻塞轮询线程
-                HandleEventAsync(triggerEvent, flag);
+                // 异步执行事件处理，不阻塞轮询线程（使用Task.Run包装并捕获异常）
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await HandleEventAsync(triggerEvent, flag);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, $"事件处理异常: EventId={triggerEvent.EventId}, EventType={triggerEvent.EventType}");
+                    }
+                });
             }
 
             lock (_lastTriggerStatus)
@@ -1240,7 +1384,7 @@ namespace WinformDevFramework.Services.PLCBasic
         /// <summary>
         /// 异步处理事件
         /// </summary>
-        private async void HandleEventAsync(PlcEventTriggeredEventArgs e,bool flag)
+        private async Task HandleEventAsync(PlcEventTriggeredEventArgs e,bool flag)
         {
             // 尝试获取信号量，最多等待100ms
             if (!await _eventSemaphore.WaitAsync(TimeSpan.FromMilliseconds(100)))
@@ -1266,61 +1410,61 @@ namespace WinformDevFramework.Services.PLCBasic
                     switch (e.EventType)
                     {
                         case "BatchCheckIn"://批次校验上升沿触发
-                            await Task.Run(() => HandleBatchCheckInAsync(e));
+                            await HandleBatchCheckInAsync(e);
                             eventHandledSuccessfully = true;
                             break;
                         case "BatchCheckOut"://批次校验下降沿触发
-                            await Task.Run(() => HandleBatchCheckOutAsync(e));
+                            await HandleBatchCheckOutAsync(e);
                             eventHandledSuccessfully = true;
                             break;
                         case "MainCheckIn"://主条码进站校验上升沿触发
-                            await Task.Run(() => HandleMainCheckInAsync(e));
+                            await HandleMainCheckInAsync(e);
                             eventHandledSuccessfully = true;
                             break;
                         case "MainCheckDownIn"://主条码进站校验下降沿触发
-                            await Task.Run(() => HandleMainCheckDownInAsync(e));
+                            await HandleMainCheckDownInAsync(e);
                             eventHandledSuccessfully = true;
                             break;
                         case "SubCheckIn"://子条码进站校验上升沿触发
-                            await Task.Run(() => HandleSubCheckInAsync(e));
+                            await HandleSubCheckInAsync(e);
                             eventHandledSuccessfully = true;
                             break;
                         case "SubCheckDownIn"://子条码进站校验下降沿触发
-                            await Task.Run(() => HandleSubCheckDownInAsync(e));
+                            await HandleSubCheckDownInAsync(e);
                             eventHandledSuccessfully = true;
                             break;
                         case "MainCheckOut"://采集加工数据上升沿触发
-                            await Task.Run(() => HandleMainCheckOutAsync(e));
+                            await HandleMainCheckOutAsync(e);
                             eventHandledSuccessfully = true;
                             break;
                         case "MainCheckDownOut"://采集加工数据下降沿触发
-                            await Task.Run(() => HandleMainDownCheckOutAsync(e));
+                            await HandleMainDownCheckOutAsync(e);
                             eventHandledSuccessfully = true;
                             break;
                         case "Processing"://表明工件已经入不可逆工艺 上升沿
-                            await Task.Run(() => HandleProcessingAsync(e));
+                            await HandleProcessingAsync(e);
                             eventHandledSuccessfully = true;
                             break;
                         case "ProcessDowning"://表明工件已经入不可逆工艺 下降沿
-                            await Task.Run(() => HandleProcessingDownAsync(e));
+                            await HandleProcessingDownAsync(e);
                             eventHandledSuccessfully = true;
                             break;
                         //返修上线相关
                         case "Repair":     //上升沿触发
-                            await Task.Run(() => HandleRepairUpAsync(e));
+                            await HandleRepairUpAsync(e);
                             eventHandledSuccessfully = true;
                             break;
                         //标定参数
                         case "Calibra_Data":
-                            await Task.Run(() => HandleCalibraUpDataAsync(e));
+                            await HandleCalibraUpDataAsync(e);
                             eventHandledSuccessfully = true;
                             break;
                         //打印上升沿处理事件
                         case "PrintExchange":
-                            await Task.Run(() => HandlePrintExchangeAsync(e));
+                            await HandlePrintExchangeAsync(e);
                             break;
                         case "Bounce"://跳动
-                            await Task.Run(() => HandleBounceExchangeAsync(e));
+                            await HandleBounceExchangeAsync(e);
                             break;
                         default:
                             _logger.LogWarning($"未知的事件类型: {e.EventType}");
@@ -1333,7 +1477,7 @@ namespace WinformDevFramework.Services.PLCBasic
                     {
                         //参数下发下降沿
                         case "ParameterDistributionDown":
-                                await Task.Run(() => HandleParameterDistributionDownAsync(e));
+                                await HandleParameterDistributionDownAsync(e);
                             break;
                         case "Bounce"://跳动
                             break;
@@ -1461,13 +1605,12 @@ namespace WinformDevFramework.Services.PLCBasic
                 // 第一步：结束当前使用的批次，将状态改为4
                 if (string.IsNullOrEmpty(msg))
                 {
-                    var currentActiveBatch = _wipBatchRepository.Query()
-                        .FirstOrDefault(w => w.Status == 2);
+                    var currentActiveBatch = await _wipBatchRepository.QueryByClauseAsync(w => w.Status == 2);
 
                     if (currentActiveBatch != null)
                     {
                         currentActiveBatch.Status = 4;
-                        _wipBatchRepository.Update(currentActiveBatch);
+                        await _wipBatchRepository.UpdateAsync(currentActiveBatch);
                         _logger.LogInformation($"结束当前批次: BatchCode={currentActiveBatch.BatchCode}, Status更新为4");
                     }
                 }
@@ -1475,8 +1618,7 @@ namespace WinformDevFramework.Services.PLCBasic
                 // 第二步：验证批次码是否已存在
                 if (string.IsNullOrEmpty(msg))
                 {
-                    var existingBatch = _wipBatchRepository.Query()
-                        .FirstOrDefault(w => w.BatchCode == batchCode);
+                    var existingBatch = await _wipBatchRepository.QueryByClauseAsync(w => w.BatchCode == batchCode);
 
                     if (existingBatch != null)
                     {
@@ -1521,7 +1663,7 @@ namespace WinformDevFramework.Services.PLCBasic
                         CreateTime = DateTime.Now,
                         CreateUser = "System"
                     };
-                    _wipBatchRepository.Insert(newBatch);
+                    await _wipBatchRepository.InsertAsync(newBatch);
                     _logger.LogInformation($"新增批次记录: BatchCode={batchCode}, Status=1");
                 }
             }
@@ -1652,79 +1794,118 @@ namespace WinformDevFramework.Services.PLCBasic
                 string batchCheckId = readDataPointsDict.ContainsKey("BatchCheckID") ? readDataPointsDict["BatchCheckID"] : string.Empty;
                 //程序号
                 string RecipeVer= readDataPointsDict.ContainsKey("RecipeVer") ? readDataPointsDict["RecipeVer"] : string.Empty;
+                //返修标志
+                bool atRepair= readDataPointsDict.ContainsKey("AtRepair") ? bool.Parse(readDataPointsDict["AtRepair"]) : false;
+                WipBarCode wipBarcode=new WipBarCode();
+                //执行返修操作
+                if (atRepair) 
+                { 
+                   string suPartId= readDataPointsDict.ContainsKey("PartID1") ? readDataPointsDict["PartID1"] : string.Empty;
+                    if(string.IsNullOrWhiteSpace(suPartId))
+                    {
+                        msg = $"返修标识触发，{stationCode}工站未传递子条码信息";
+                        await ErrorMsg(plcCode, stationCode, suPartId, msg, 103, writeDataPoints, dataToWrite);
+                        DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
+                        return;
+                    }
+                    //根据子条码获取主条码信息
+                    var material = await _wipMaterialInfoRepository.QueryByClauseAsync(o => o.MaterialCode == suPartId);
+                    if (material==null)
+                    {
+                        msg = $"未找到该零件信息: 子条码={suPartId}";
+                        await ErrorMsg(plcCode, stationCode, suPartId, msg, 103, writeDataPoints, dataToWrite);
+                        DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
+                        return;
+                    }
+                    wipBarcode = await _wipBarcodeRepository.QueryByClauseAsync(o => o.BarCode == material.BarCode);
+                    if(wipBarcode == null)
+                    {
+                        msg = $"未找到主条码信息: 子条码={suPartId}";
+                        await ErrorMsg(plcCode, stationCode, suPartId, msg, 103, writeDataPoints, dataToWrite);
+                        DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
+                        return;
+                    }
+                    //创建新主条码
+                    partId = await GenerateBarcode(stationCode);
+                    partType = wipBarcode.ModelCode;
+                    RecipeVer = wipBarcode.RecipeCode;
+                }
+
                 int PartStatus=0;
                 bool isRecipeMatch = false;
                 StationProcessInfo stationProcessInfo = null;
                 PLC_StationRecipeCurrent stationRecipeCurrent = new PLC_StationRecipeCurrent();
-                WipBarCode wipBarcode = new WipBarCode();
-                //OP05工站单独处理  型号、条码信息都为空
-                if (string.IsNullOrWhiteSpace(RecipeVer))
+                if (!atRepair)
                 {
-                    msg = $"{stationCode}工站未传递程序版本号";
-                    _logger.LogInformation($"发布主零件进站校验失败: StationCode={stationCode}, Barcode={partId},失败原因{msg}");
-                    await ErrorMsg(plcCode, stationCode, partId, msg, 4, writeDataPoints, dataToWrite);
-                    DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
-                    return;
-                }
+                    if (stationCode == "OP05")
+                    {
+                        var parameterDistribution = await _parameterDistributionRepository.QueryByClauseAsync(pd => pd.RecipeCode == RecipeVer);
+                        if (parameterDistribution == null)
+                        {
+                            msg = $"OP05-1工站程序号{RecipeVer}未获取到对应参数分配信息";
+                            _logger.LogInformation($"发布主零件进站校验失败: StationCode={stationCode}, Barcode={partId},失败原因{msg}");
+                            await ErrorMsg(plcCode, stationCode, partId, msg, 4, writeDataPoints, dataToWrite);
+                            DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
+                            return;
+                        }
+                        partType = parameterDistribution.ProductModelCode;
+                        //重新生成条码
+                        partId = await GenerateBarcode(stationCode);
 
-                if (stationCode == "OP05")
-                {
-                    var parameterDistribution = _parameterDistributionRepository.Query()
-                                                 .FirstOrDefault(pd => pd.RecipeCode == RecipeVer);
-                    if(parameterDistribution == null)
-                    {
-                        msg = $"OP05-1工站程序号{RecipeVer}未获取到对应参数分配信息";
-                        _logger.LogInformation($"发布主零件进站校验失败: StationCode={stationCode}, Barcode={partId},失败原因{msg}");
-                        await ErrorMsg(plcCode, stationCode, partId, msg, 4, writeDataPoints, dataToWrite);
-                        DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
-                        return;
                     }
-                    partType = parameterDistribution.ProductModelCode;
-                }
-                else
-                {
-                    if (string.IsNullOrWhiteSpace(partType))
+                    else
                     {
-                        msg = $"{stationCode}工站未传递型号信息";
-                        await ErrorMsg(plcCode, stationCode, partId, msg, 4, writeDataPoints, dataToWrite);
-                        DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
-                        return;
-                    }
-                    if (string.IsNullOrEmpty(partId))
-                    {
-                        msg = $"{stationCode}工站未传递条码信息";
-                        await ErrorMsg(plcCode, stationCode, partId, msg, 4, writeDataPoints, dataToWrite);
-                        DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
-                        return;
-                    }
+                        //OP05工站单独处理  型号、条码信息都为空
+                        if (string.IsNullOrWhiteSpace(RecipeVer))
+                        {
+                            msg = $"{stationCode}工站未传递程序版本号";
+                            _logger.LogInformation($"发布主零件进站校验失败: StationCode={stationCode}, Barcode={partId},失败原因{msg}");
+                            await ErrorMsg(plcCode, stationCode, partId, msg, 4, writeDataPoints, dataToWrite);
+                            DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
+                            return;
+                        }
+                        if (string.IsNullOrWhiteSpace(partType))
+                        {
+                            msg = $"{stationCode}工站未传递型号信息";
+                            await ErrorMsg(plcCode, stationCode, partId, msg, 4, writeDataPoints, dataToWrite);
+                            DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
+                            return;
+                        }
+                        if (string.IsNullOrEmpty(partId))
+                        {
+                            msg = $"{stationCode}工站未传递条码信息";
+                            await ErrorMsg(plcCode, stationCode, partId, msg, 4, writeDataPoints, dataToWrite);
+                            DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
+                            return;
+                        }
 
-                     wipBarcode = _wipBarcodeRepository.QueryByClause(o => o.ModelCode == partType && o.RecipeCode == RecipeVer&&o.BarCode == partId);
-                    if (wipBarcode == null)
+                        wipBarcode = await _wipBarcodeRepository.QueryByClauseAsync(o => o.ModelCode == partType && o.RecipeCode == RecipeVer && o.BarCode == partId);
+                        if (wipBarcode == null)
+                        {
+                            msg = $"{stationCode}工站{partId}条码没有在制信息";
+                            await ErrorMsg(plcCode, stationCode, partId, msg, 5, writeDataPoints, dataToWrite);
+                            DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
+                            return;
+                        }
+                        if (wipBarcode.NextStationCode != stationCode)
+                        {
+                            msg = $"当前站点{wipBarcode.NextStationCode}与目标站点{stationCode}不一致";
+                            await ErrorMsg(plcCode, stationCode, partId, msg, 6, writeDataPoints, dataToWrite);
+                            DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
+                            return;
+                        }
+                    }
+                    var process = await _wipBarCodeProcessRepository.QueryByClauseAsync(o => o.BarCode == partId && o.StationCode == stationCode);
+                    if (process == null)
                     {
-                        msg = $"{stationCode}工站{partId}条码没有在制信息";
-                        await ErrorMsg(plcCode, stationCode, partId, msg,5, writeDataPoints, dataToWrite);
+                        msg = $"该条码{partId}在工站{stationCode}有不可逆信息";
+
+                        await ErrorMsg(plcCode, stationCode, partId, msg, 6, writeDataPoints, dataToWrite);
                         DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
                         return;
                     }
-                    if (wipBarcode.NextStationCode != stationCode)
-                    {
-                        msg = $"当前站点{wipBarcode.NextStationCode}与目标站点{stationCode}不一致";
-                        await ErrorMsg(plcCode, stationCode, partId, msg,6, writeDataPoints, dataToWrite);
-                        DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
-                        return;
-                    }
-                }
-               var process= _wipBarCodeProcessRepository.QueryByClause(o => o.BarCode == partId && o.StationCode == stationCode);
-                if (process == null)
-                {
-                    msg = $"该条码{partId}在工站{stationCode}有不可逆信息";
-
-                    await ErrorMsg(plcCode, stationCode, partId, msg,6, writeDataPoints, dataToWrite);
-                    DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
-                    return;
-                }
-
-                stationRecipeCurrent = _stationRecipeCurrentRepository.Query() .FirstOrDefault(sr => sr.PlcCode == plcCode && sr.StationCode == stationCode);
+                }              
+                stationRecipeCurrent = await _stationRecipeCurrentRepository.QueryByClauseAsync(sr => sr.PlcCode == plcCode && sr.StationCode == stationCode);
                 if (stationRecipeCurrent == null)
                 {
                     isRecipeMatch = false;
@@ -1733,7 +1914,6 @@ namespace WinformDevFramework.Services.PLCBasic
                 {
                      isRecipeMatch = string.Equals(RecipeVer, stationRecipeCurrent.RecipeCode, StringComparison.OrdinalIgnoreCase);
                 }
-
                 if (isRecipeMatch)
                 {
                     _logger.LogInformation($"参数版本一致: RecipeVer={RecipeVer}, 当前Recipe={stationRecipeCurrent.RecipeCode}");
@@ -1747,8 +1927,7 @@ namespace WinformDevFramework.Services.PLCBasic
                    string mbRecipeVer= stationCode == "OP05" ? RecipeVer : wipBarcode.RecipeCode;
                     _logger.LogInformation($"参数版本不一致，开始下发新参数: 当前RecipeVer={RecipeVer}, 目标Recipe={mbRecipeVer}");
                     // 3.1 拿RecipeVer值匹配PLC_ParameterDistribution的RecipeCode
-                    var parameterDistribution = _parameterDistributionRepository.Query()
-                        .FirstOrDefault(pd => pd.RecipeCode == mbRecipeVer);
+                    var parameterDistribution = await _parameterDistributionRepository.QueryByClauseAsync(pd => pd.RecipeCode == mbRecipeVer);
                     if(parameterDistribution==null)
                     {
                         msg = $"未找到参数下发配置: RecipeCode={mbRecipeVer}";
@@ -1756,7 +1935,7 @@ namespace WinformDevFramework.Services.PLCBasic
                         DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
                         return;
                     }
-                    var distributionDetails = _parameterDistributionDetailRepository.QueryListByClause(o=>o.DistributionID== parameterDistribution.ID&&o.StationCode==stationCode).ToList();
+                    var distributionDetails = await _parameterDistributionDetailRepository.QueryListByClauseAsync(o=>o.DistributionID== parameterDistribution.ID&&o.StationCode==stationCode);
                     if (distributionDetails == null)
                     {
                         msg = $"未找到程序号{mbRecipeVer}该工站{stationCode}的下发详情配置信息";
@@ -1794,7 +1973,7 @@ namespace WinformDevFramework.Services.PLCBasic
                         CreateUser = "System",
                         CreateTime = DateTime.Now
                     };
-                    _parameterDistributionHistoryRepository.Insert(history);
+                    await _parameterDistributionHistoryRepository.InsertAsync(history);
 
                     // 3.5 创建历史明细记录
                     List<PLC_ParameterDistributionDetailHistory> historyDetails = new List<PLC_ParameterDistributionDetailHistory>();
@@ -1815,7 +1994,7 @@ namespace WinformDevFramework.Services.PLCBasic
                         };
                         historyDetails.Add(historyDetail);
                     }
-                    _parameterDistributionDetailHistoryRepository.Insert(historyDetails);
+                    await _parameterDistributionDetailHistoryRepository.InsertAsync(historyDetails);
                     _logger.LogInformation($"创建历史记录成功: HistoryID={history.ID}, DetailCount={historyDetails.Count}");
 
                     // 3.6 设置PartType和RecipeVer
@@ -1917,31 +2096,25 @@ namespace WinformDevFramework.Services.PLCBasic
                         CreateTime = DateTime.Now,
                         CreateUser = "System"
                     };
-                    _parameterDistributionRecordRepository.Insert(record);
+                    await _parameterDistributionRecordRepository.InsertAsync(record);
 
                     // 3.11 更新下发记录明细的RecordID
                     foreach (var recordDetail in recordDetails)
                     {
                         recordDetail.RecordID = record.ID;
                     }
-                    _parameterDistributionRecordDetailRepository.Insert(recordDetails);
+                    await _parameterDistributionRecordDetailRepository.InsertAsync(recordDetails);
 
                     _logger.LogInformation($"创建下发记录成功: RecordID={record.ID}, Status={status}, Success={successCount}, Failed={failedCount}");
 
                     // 3.12 更新PLC_StationRecipeCurrent表
-                    UpdateStationRecipeCurrent(plcCode, stationCode, stationRecipeCurrent.RecipeCode,
+                    await UpdateStationRecipeCurrent(plcCode, stationCode, stationRecipeCurrent.RecipeCode,
                         stationRecipeCurrent.ProductModelCode, stationRecipeCurrent.RoutingCode, "System");
                     msg="参数下发完成";
                     // 发布PLC参数下发事件（下发完成）
                     DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
 
-                }
-                if (stationCode == "OP05")
-                {
-                    //获取条码号
-                    partId = GenerateBarcode(stationCode);
-                }
-                
+                }                
                 //成功才写入的数据
                 dataToWrite.Add("PartType", partType);
                 dataToWrite.Add("PartID", partId);
@@ -1949,10 +2122,7 @@ namespace WinformDevFramework.Services.PLCBasic
                 dataToWrite.Add("PartStatus", PartStatus);
                 dataToWrite.Add("RecipeVer", RecipeVer);
                 DateTime today = DateTime.Today;
-                bool hasTodayData = _wipBarcodeRepository.Query()
-                    .Any(w => w.StationCode == stationCode &&
-                              w.ModelCode == partType &&
-                              w.CreateTime >= today);
+                bool hasTodayData = await _wipBarcodeRepository.QueryByClauseAsync(o => o.StationCode == stationCode && o.ModelCode == partType && o.CreateTime >= today) != null;
                 dataToWrite.Add("IsFir", hasTodayData ? false : true);
                 dataToWrite.Add("MasterPartStatus", false);
                 //转台路由指示工位专用状态字
@@ -1967,7 +2137,52 @@ namespace WinformDevFramework.Services.PLCBasic
                 }
 
                 // PLC 操作完成后，异步更新或新增 WipBarCode 表数据
-                await UpdateWipBarcodeAsync(partId, partType, stationCode, batchCheckId, stationProcessInfo);
+                if (!atRepair)
+                {
+                    await UpdateWipBarcodeAsync(partId, partType, stationCode, batchCheckId, stationProcessInfo);
+                }
+                else
+                {
+                    // 返修场景：更新主条码、子零件关联关系，并保存历史记录
+                    try
+                    {
+                        // 1. 保存原主条码的历史记录
+                        await _wipBarcodeHistoryRepository.SaveHistoryAsync(wipBarcode, "Repair");
+                        _logger.LogInformation($"返修-保存原主条码历史记录: OldBarCode={wipBarcode.BarCode}, NewBarCode={partId}");
+
+                        // 2. 更新主条码表的 Barcode 字段为新条码 partId
+                        wipBarcode.BarCode = partId;
+                        wipBarcode.InputTime = DateTime.Now;
+                        wipBarcode.OutputTime = null;
+                        wipBarcode.StationCode = stationCode;
+                        wipBarcode.PrStationCode = wipBarcode.StationCode;
+                        wipBarcode.RepairCount = (wipBarcode.RepairCount ?? 0) + 1;
+                        wipBarcode.UpdateUser = "system";
+                        wipBarcode.UpdateTime = DateTime.Now;
+                        await _wipBarcodeRepository.UpdateAsync (wipBarcode);
+                        _logger.LogInformation($"返修-更新主条码: BarCode={partId}, RepairCount={wipBarcode.RepairCount}");
+
+                        // 3. 更新 WipMaterialInfo 表中所有 BarCode 等于原主条码的记录
+                        string oldBarCode = wipBarcode.BarCode;
+                        var materialList = await _wipMaterialInfoRepository.QueryListByClauseAsync(m => m.BarCode == oldBarCode);
+
+                        if (materialList != null && materialList.Count > 0)
+                        {
+                            foreach (var mat in materialList)
+                            {
+                                mat.BarCode = partId;
+                                mat.UpdateTime = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+                                mat.UpdateUser = "system";
+                            }
+                            await _wipMaterialInfoRepository.UpdateAsync(materialList);
+                            _logger.LogInformation($"返修-批量更新子零件关联主条码: Count={materialList.Count}, OldBarCode={oldBarCode}, NewBarCode={partId}");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, $"返修-更新主条码和子零件关联失败: OldBarCode={wipBarcode.BarCode}, NewBarCode={partId}");
+                    }
+                }
 
                 // 发布主零件进站校验事件到前端监控
                 if (string.IsNullOrEmpty(msg))
@@ -1992,6 +2207,7 @@ namespace WinformDevFramework.Services.PLCBasic
         {
             //直接返回错误
             dataToWrite.Add("PartNG", true);
+            dataToWrite.Add("PartIDReqDone", true);
             // 主条码进站失败错误代码：3，错误信息：msg
             dataToWrite.Add("MainCheckInErrorCode", MainCheckInErrorCode);
             dataToWrite.Add("MainCheckInErrorMsg", msg);
@@ -2218,10 +2434,9 @@ namespace WinformDevFramework.Services.PLCBasic
                 // 验证子零件是否已存在（避免重复扫描）
                 if (string.IsNullOrEmpty(msg))
                 {
-                    var existingCount = _wipMaterialInfoRepository.Query()
-                        .Count(w => w.BarCode == partId && w.StationCode == stationCode && w.MaterialCode == subpartId);
+                    var existingCount = await _wipMaterialInfoRepository.QueryByClauseAsync(w => w.BarCode == partId && w.StationCode == stationCode && w.MaterialCode == subpartId);
 
-                    if (existingCount > 0)
+                    if (existingCount !=null)
                     {
                         msg = $"WipMaterialInfo 已存在该条码 {partId} 和工站 {stationCode} 对应的子零件 {subpartId}";
                         await SuCheckErrorMsg(plcCode, stationCode, partId, subpartId, msg, 101, writeDataPoints, dataToWrite);
@@ -2233,17 +2448,17 @@ namespace WinformDevFramework.Services.PLCBasic
                 int scannedCount = 0;
                 if (string.IsNullOrEmpty(msg))
                 {
-                    scannedCount = _wipMaterialInfoRepository.Query()
-                        .Count(w => w.BarCode == partId && w.StationCode == stationCode && w.MaterialType == "SubPart");
+                    scannedCount = await _wipMaterialInfoRepository.GetCountAsync(w => w.BarCode == partId && w.StationCode == stationCode && w.MaterialType == "SubPart");
 
                     _logger.LogInformation($"主条码 {partId} 在工站 {stationCode} 已扫描 {scannedCount} 个子零件");
                 }
 
                 // 计算当前是第几个零件
                 int currentPartSequence = scannedCount + 1;
-                flag = ValidateBarcodeFormat(subpartId, currentPartSequence, stationProcessInfo, out msg);
-                if (!flag)
+                var validationResult = await ValidateBarcodeFormat(subpartId, currentPartSequence, stationProcessInfo);
+                if (!validationResult.isValid)
                 {
+                    msg = validationResult.errorMsg;
                     await SuCheckErrorMsg(plcCode, stationCode, partId, subpartId, msg, 101, writeDataPoints, dataToWrite);
                     DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
                     return;
@@ -2499,7 +2714,7 @@ namespace WinformDevFramework.Services.PLCBasic
                     return;
                 }
 
-                var process= _wipProcessingIrreversibleRepository.QueryByClause(o=>o.BarCode==processingPartId&&o.StationCode==stationCode);
+                var process= await _wipProcessingIrreversibleRepository.QueryByClauseAsync(o=>o.BarCode==processingPartId&&o.StationCode==stationCode);
                 if (process != null)
                 {
                     msg = $"条码 {processingPartId} 在工站 {stationCode} 已存在不可逆加工记录，跳过处理";
@@ -2536,7 +2751,7 @@ namespace WinformDevFramework.Services.PLCBasic
                 await WriteDataPointsToPlc(plcCode, writeDataPoints, dataToWrite);
                 DataPushBus.PublishMainPartStationCheck(stationCode, processingPartId, true, "可逆工站已标注成功");
                 _logger.LogInformation($"已向PLC下发ProcessingDone=true");
-                _wipProcessingIrreversibleRepository.Insert(irreversibleRecord);
+                await _wipProcessingIrreversibleRepository.InsertAsync(irreversibleRecord);
                 _logger.LogInformation($"不可逆加工标记记录已保存: BarCode={processingPartId}");
             }
             catch (Exception ex)
@@ -2701,7 +2916,7 @@ namespace WinformDevFramework.Services.PLCBasic
                     return;
                 }
 
-                wipProcessingIrreversible = _wipProcessingIrreversibleRepository.QueryByClause(o => o.BarCode == barCode && o.StationCode == stationCode);
+                wipProcessingIrreversible = await _wipProcessingIrreversibleRepository.QueryByClauseAsync(o => o.BarCode == barCode && o.StationCode == stationCode);
                 if (wipProcessingIrreversible != null)
                 {
                     errorMsg = $"条码 [{barCode}] 已处理，不能重复处理";
@@ -2752,15 +2967,14 @@ namespace WinformDevFramework.Services.PLCBasic
                 
 
                 // 验证零件是否匹配WipMaterialInfo
-                    var existingSubParts = _wipMaterialInfoRepository.Query()
-                        .Where(w => w.BarCode == barCode && w.StationCode == stationCode && w.MaterialType == "SubPart")
-                        .Select(w => w.MaterialCode)
-                        .ToList();
+                    var existingSubParts = await _wipMaterialInfoRepository.QueryListByClauseAsync(
+                        w => w.BarCode == barCode && w.StationCode == stationCode && w.MaterialType == "SubPart");
+                    var subPartCodes = existingSubParts?.Select(w => w.MaterialCode).ToList() ?? new List<string>();
 
                     // 检查采集的零件是否都在WipMaterialInfo中存在
                     foreach (var subPart in collectedSubParts)
                     {
-                        if (!existingSubParts.Contains(subPart))
+                        if (!subPartCodes.Contains(subPart))
                         {
                             errorMsg = $"采集的零件 {subPart} 与系统记录不匹配";
                         await WriteErrorStatusToPlc(plcCode, writeDataPoints, 2, errorMsg);
@@ -2792,9 +3006,9 @@ namespace WinformDevFramework.Services.PLCBasic
                     CreateTime = DateTime.Now,
                     CreateUser = "System"
                 };
-                _wipBarCodeProcessRepository.Insert(processRecord);
+                await _wipBarCodeProcessRepository.InsertAsync(processRecord);
                 // 更新WipBarCode表
-                UpdateWipBarCodeStatus(barCode, stationCode);
+                await UpdateWipBarCodeStatus(barCode, stationCode);
                 await WriteDataPointsToPlc(plcCode, writeDataPoints, dataToWrite);
 
                 // 写入PLC响应
@@ -2946,16 +3160,13 @@ namespace WinformDevFramework.Services.PLCBasic
                 {
                     return;
                 }
-
                 // 第二步：获取事件数据点配置
                 if (!GetEventDataPoints(e.EventId, out var readDataPoints, out var writeDataPoints))
                 {
                     return;
                 }
-
                 // 第三步：异步读取数据点
                 Dictionary<string, string> readDataPointsDict = await ReadEventDataPointsAsync(e.PlcCode, readDataPoints);
-
                 // 第四步：采集标定数据并回写PLC
                 await HandleCalibraUpEvent(e.PlcCode, e.StationCode, writeDataPoints, readDataPointsDict);
 
@@ -3266,8 +3477,7 @@ namespace WinformDevFramework.Services.PLCBasic
                 _logger.LogInformation($"MES在线模式参数下发开始: PlcCode={plcCode}, StationCode={stationCode}, PartType={partType}, RecipeVer={recipeVer}");
 
                 // 1. 根据产品型号编码、工艺参数版本号查询PLC_ParameterDistribution信息
-                var parameterDistribution = _parameterDistributionRepository.Query()
-                    .FirstOrDefault(p => p.ProductModelCode == partType && p.RecipeCode == recipeVer);
+                var parameterDistribution = await _parameterDistributionRepository.QueryByClauseAsync(p => p.ProductModelCode == partType && p.RecipeCode == recipeVer);
 
                 PLC_ParameterDistribution distributionToUse;
                 List<PLC_ParameterDistributionDetail> distributionDetails;
@@ -3277,7 +3487,8 @@ namespace WinformDevFramework.Services.PLCBasic
                     // 2. 如果没有信息，获取PLC_ParameterDistribution表的第一条信息和对应的详细信息
                     _logger.LogInformation($"未找到匹配的参数配置，使用第一条配置: PartType={partType}, RecipeVer={recipeVer}");
                     
-                    var firstDistribution = _parameterDistributionRepository.Query().FirstOrDefault();
+                    var allDistributions = await _parameterDistributionRepository.QueryAsync();
+                    var firstDistribution = allDistributions?.FirstOrDefault();
                     if (firstDistribution == null)
                     {
                         _logger.LogError($"PLC_ParameterDistribution表为空，无法进行参数下发");
@@ -3298,9 +3509,8 @@ namespace WinformDevFramework.Services.PLCBasic
                     };
 
                     // 根据工站和ID查出来的PLC_ParameterDistributionDetail信息
-                    distributionDetails = _parameterDistributionDetailRepository.Query()
-                        .Where(d => d.DistributionID == firstDistribution.ID && d.StationCode == stationCode)
-                        .ToList();
+                    distributionDetails = await _parameterDistributionDetailRepository.QueryListByClauseAsync(
+                        d => d.DistributionID == firstDistribution.ID && d.StationCode == stationCode);
 
                     if (distributionDetails == null || !distributionDetails.Any())
                     {
@@ -3346,7 +3556,7 @@ namespace WinformDevFramework.Services.PLCBasic
                     }
 
                     // 保存新的参数配置到PLC_ParameterDistribution表
-                    _parameterDistributionRepository.Insert(distributionToUse);
+                    await _parameterDistributionRepository.InsertAsync(distributionToUse);
                     _logger.LogInformation($"创建新的参数配置记录: DistributionID={distributionToUse.ID}");
 
                     // 更新明细的DistributionID并保存
@@ -3354,7 +3564,7 @@ namespace WinformDevFramework.Services.PLCBasic
                     {
                         detail.DistributionID = distributionToUse.ID;
                     }
-                    _parameterDistributionDetailRepository.Insert(list);
+                    await _parameterDistributionDetailRepository.InsertAsync(list);
                     _logger.LogInformation($"保存参数下发明细: Count={list.Count}");
                 }
                 else
@@ -3363,9 +3573,8 @@ namespace WinformDevFramework.Services.PLCBasic
                     _logger.LogInformation($"找到匹配的参数配置: DistributionID={parameterDistribution.ID}");
                     
                     distributionToUse = parameterDistribution;
-                    distributionDetails = _parameterDistributionDetailRepository.Query()
-                        .Where(d => d.DistributionID == parameterDistribution.ID && d.StationCode == stationCode)
-                        .ToList();
+                    distributionDetails = await _parameterDistributionDetailRepository.QueryListByClauseAsync(
+                        d => d.DistributionID == parameterDistribution.ID && d.StationCode == stationCode);
 
                     if (distributionDetails == null || !distributionDetails.Any())
                     {
@@ -3433,7 +3642,7 @@ namespace WinformDevFramework.Services.PLCBasic
                             CreateUser = "System",
                             CreateTime = DateTime.Now
                         };
-                        _parameterDistributionHistoryRepository.Insert(history);
+                        await _parameterDistributionHistoryRepository.InsertAsync(history);
 
                         // 创建历史明细记录
                         List<PLC_ParameterDistributionDetailHistory> historyDetails = new List<PLC_ParameterDistributionDetailHistory>();
@@ -3459,11 +3668,11 @@ namespace WinformDevFramework.Services.PLCBasic
                             };
                             historyDetails.Add(historyDetail);
                         }
-                        _parameterDistributionDetailHistoryRepository.Insert(historyDetails);
+                        await _parameterDistributionDetailHistoryRepository.InsertAsync(historyDetails);
                         _logger.LogInformation($"创建历史记录成功: HistoryID={history.ID}, DetailCount={historyDetails.Count}");
 
                         // 更新参数下发明细表
-                        _parameterDistributionDetailRepository.Update(distributionDetails);
+                        await _parameterDistributionDetailRepository.UpdateAsync(distributionDetails);
                         _logger.LogInformation($"更新参数下发明细: Count={distributionDetails.Count}");
                     }
                     else
@@ -3578,14 +3787,14 @@ namespace WinformDevFramework.Services.PLCBasic
                     CreateTime = DateTime.Now,
                     CreateUser = "System"
                 };
-                _parameterDistributionRecordRepository.Insert(record);
+                await _parameterDistributionRecordRepository.InsertAsync(record);
 
                 // 更新下发记录明细的RecordID
                 foreach (var recordDetail in recordDetails)
                 {
                     recordDetail.RecordID = record.ID;
                 }
-                _parameterDistributionRecordDetailRepository.Insert(recordDetails);
+                await _parameterDistributionRecordDetailRepository.InsertAsync(recordDetails);
 
                 _logger.LogInformation($"创建下发记录成功: RecordID={record.ID}, Status={status}, Success={successCount}, Failed={failedCount}");
             }
@@ -3692,7 +3901,7 @@ namespace WinformDevFramework.Services.PLCBasic
                     return;
                 }
 
-                var existingBarcode = _wipBarcodeRepository.Query().FirstOrDefault(w => w.BarCode == barCode);
+                var existingBarcode = await _wipBarcodeRepository.QueryByClauseAsync(o => o.BarCode == barCode);
                 DateTime now = DateTime.Now;
 
                 if (existingBarcode == null)
@@ -3715,7 +3924,7 @@ namespace WinformDevFramework.Services.PLCBasic
                         RecipeCode = stationProcessInfo?.Recipe
                     };
 
-                    _wipBarcodeRepository.Insert(newBarcode);
+                    await _wipBarcodeRepository.InsertAsync(newBarcode);
                     _logger.LogInformation($"新增WipBarcode记录: BarCode={barCode}, ModelCode={modelCode}");
                 }
                 else
@@ -3731,7 +3940,7 @@ namespace WinformDevFramework.Services.PLCBasic
                     existingBarcode.UpdateUser = "system";
                     existingBarcode.UpdateTime = now;
 
-                    _wipBarcodeRepository.Update(existingBarcode);
+                   await _wipBarcodeRepository.UpdateAsync(existingBarcode);
                     _logger.LogInformation($"更新WipBarcode记录: BarCode={barCode}, StationCode={stationCode}, NextStationCode={nextStationCode}");
                 }
             }
@@ -3925,22 +4134,21 @@ namespace WinformDevFramework.Services.PLCBasic
         /// <summary>
         /// 更新WipBarCode表状态
         /// </summary>
-        private void UpdateWipBarCodeStatus(string barCode, string stationCode)
+        private async Task UpdateWipBarCodeStatus(string barCode, string stationCode)
         {
             try
             {
-                var wipBarCode = _wipBarcodeRepository.Query()
-                    .FirstOrDefault(w => w.BarCode == barCode && w.StationCode == stationCode);
+                var wipBarCode = await _wipBarcodeRepository.QueryByClauseAsync(o => o.BarCode == barCode && o.StationCode == stationCode);
 
                 if (wipBarCode != null)
                 {
                     // 先保存历史记录
-                    _wipBarcodeHistoryRepository.SaveHistoryAsync(wipBarCode, "UpdateStatus").Wait();
+                    await _wipBarcodeHistoryRepository.SaveHistoryAsync(wipBarCode, "UpdateStatus");
                     _logger.LogInformation($"保存WipBarCode历史记录: BarCode={barCode}, StationCode={stationCode}");
 
                     wipBarCode.BarCodeType = "0";
                     wipBarCode.OutputTime = DateTime.Now;
-                    _wipBarcodeRepository.Update(wipBarCode);
+                    await _wipBarcodeRepository.UpdateAsync (wipBarCode);
                     _logger.LogInformation($"更新WipBarCode状态: BarCode={barCode}, StationCode={stationCode}, BarCodeType=0, OutputTime={wipBarCode.OutputTime}");
                 }
             }
@@ -4210,13 +4418,12 @@ namespace WinformDevFramework.Services.PLCBasic
             return readDataPointsDict;
         }
 
-        private string GenerateBarcode(string stationCode)
+        private async Task<string> GenerateBarcode(string stationCode)
         {
             try
             {
                 // 从工站当前生产状态获取工艺路线
-                var stationRecipe = _stationRecipeCurrentRepository.Query()
-                    .FirstOrDefault(sr => sr.StationCode == stationCode);
+                var stationRecipe = await _stationRecipeCurrentRepository.QueryByClauseAsync(sr => sr.StationCode == stationCode);
 
                 if (stationRecipe == null || string.IsNullOrEmpty(stationRecipe.RoutingCode))
                 {
@@ -4227,8 +4434,8 @@ namespace WinformDevFramework.Services.PLCBasic
                 string routingCode = stationRecipe.RoutingCode;
 
                 // 从数据库获取工艺路线详情
-                var routing = _routingRepository.Query()
-                    .FirstOrDefault(r => r.RoutingCode == routingCode);
+                var routingList = await _routingRepository.QueryListByClauseAsync(r => r.RoutingCode == routingCode);
+                var routing = routingList?.FirstOrDefault();
 
                 if (routing == null)
                 {
@@ -4236,8 +4443,8 @@ namespace WinformDevFramework.Services.PLCBasic
                     return string.Empty;
                 }
 
-                var station = _routingListRepository.Query()
-                    .FirstOrDefault(s => s.RoutingId == routing.RoutingID && s.StationCode == stationCode);
+                var stationList = await _routingListRepository.QueryListByClauseAsync(s => s.RoutingId == routing.RoutingID && s.StationCode == stationCode);
+                var station = stationList?.FirstOrDefault();
 
                 if (station == null)
                 {
@@ -4253,8 +4460,8 @@ namespace WinformDevFramework.Services.PLCBasic
                 }
 
                 // 从数据库获取条码规则
-                var barCodeRule = _barCodeRuleRepository.Query()
-                    .FirstOrDefault(r => r.BarCodeName == barCodeName);
+                var barCodeRuleList = await _barCodeRuleRepository.QueryListByClauseAsync(r => r.BarCodeName == barCodeName);
+                var barCodeRule = barCodeRuleList?.FirstOrDefault();
 
                 if (barCodeRule == null)
                 {
@@ -4262,19 +4469,20 @@ namespace WinformDevFramework.Services.PLCBasic
                     return string.Empty;
                 }
 
-                var barCodeRuleList = _barCodeRuleListRepository.Query()
+                var barCodeRuleDetailList = await _barCodeRuleListRepository.QueryListByClauseAsync(rl => rl.BarCodeRuleId == barCodeRule.BarCodeRuleId);
+                var ruleDetails = barCodeRuleDetailList
                     .Where(rl => rl.BarCodeRuleId == barCodeRule.BarCodeRuleId)
                     .OrderBy(rl => rl.SortOrder)
                     .ToList();
 
-                if (barCodeRuleList == null || barCodeRuleList.Count == 0)
+                if (ruleDetails == null || ruleDetails.Count == 0)
                 {
                     _logger.LogError($"未找到条码规则明细: BarCodeRuleId={barCodeRule.BarCodeRuleId}");
                     return string.Empty;
                 }
 
                 string barcode = string.Empty;
-                foreach (var ruleItem in barCodeRuleList)
+                foreach (var ruleItem in ruleDetails)
                 {
                     string segment = GenerateBarcodeSegment(ruleItem);
                     barcode += segment;
@@ -4457,10 +4665,8 @@ namespace WinformDevFramework.Services.PLCBasic
         /// <summary>
         /// 验证条码格式是否符合工艺路线配置的规则
         /// </summary>
-        private bool ValidateBarcodeFormat(string barcode, int partSequence, StationProcessInfo stationProcessInfo, out string errorMsg)
+        private async Task<(bool isValid, string errorMsg)> ValidateBarcodeFormat(string barcode, int partSequence, StationProcessInfo stationProcessInfo)
         {
-            errorMsg = string.Empty;
-
             try
             {
 
@@ -4469,8 +4675,7 @@ namespace WinformDevFramework.Services.PLCBasic
 
                 if (stationConfig == null)
                 {
-                    errorMsg = $"未找到工站 {stationProcessInfo.StationCode} 的配置";
-                    return false;
+                    return (false, $"未找到工站 {stationProcessInfo.StationCode} 的配置");
                 }
 
                 // 根据零件序号获取对应的条码规则名称
@@ -4484,28 +4689,28 @@ namespace WinformDevFramework.Services.PLCBasic
 
                 if (string.IsNullOrEmpty(ruleName))
                 {
-                    return true;
+                    return (true, string.Empty);
                 }
 
                 // 从 MD_BarCodeRule 表获取条码规则
-                var barCodeRule = _barCodeRuleRepository.Query()
-                    .FirstOrDefault(r => r.BarCodeName == ruleName);
+                var barCodeRuleList = await _barCodeRuleRepository.QueryListByClauseAsync(r => r.BarCodeName == ruleName);
+                var barCodeRule = barCodeRuleList?.FirstOrDefault();
                 // 检查条码规则是否存在，不存在则不验证
                 if (barCodeRule == null)
                 {
-                    return true;
+                    return (true, string.Empty);
                 }
 
                 // 获取条码规则明细
-                var ruleDetails = _barCodeRuleListRepository.Query()
+                var ruleDetailsList = await _barCodeRuleListRepository.QueryListByClauseAsync(r => r.BarCodeRuleId == barCodeRule.BarCodeRuleId);
+                var ruleDetails = ruleDetailsList
                     .Where(r => r.BarCodeRuleId == barCodeRule.BarCodeRuleId)
                     .OrderBy(r => r.SortOrder)
                     .ToList();
 
                 if (ruleDetails.Count == 0)
                 {
-                    errorMsg = $"条码规则 {ruleName} 未配置明细";
-                    return false;
+                    return (false, $"条码规则 {ruleName} 未配置明细");
                 }
 
                 // 验证条码格式
@@ -4522,8 +4727,7 @@ namespace WinformDevFramework.Services.PLCBasic
                     // 检查剩余长度是否足够
                     if (currentPosition + segmentLength > barcode.Length)
                     {
-                        errorMsg = $"条码长度不足，期望长度：{barCodeRule.BarCodeLength}，实际长度：{barcode.Length}";
-                        return false;
+                        return (false, $"条码长度不足，期望长度：{barCodeRule.BarCodeLength}，实际长度：{barcode.Length}");
                     }
 
                     string segment = barcode.Substring(currentPosition, segmentLength);
@@ -4535,8 +4739,7 @@ namespace WinformDevFramework.Services.PLCBasic
                             // 固定内容验证
                             if (!string.IsNullOrEmpty(detail.Content) && segment != detail.Content)
                             {
-                                errorMsg = $"条码第 {currentPosition + 1} 位固定内容不匹配，期望：{detail.Content}，实际：{segment}";
-                                return false;
+                                return (false, $"条码第 {currentPosition + 1} 位固定内容不匹配，期望：{detail.Content}，实际：{segment}");
                             }
                             break;
 
@@ -4545,8 +4748,7 @@ namespace WinformDevFramework.Services.PLCBasic
                             string expectedFormat = detail.Content?.Trim() ?? "yyyyMMdd";
                             if (!DateTime.TryParseExact(segment, expectedFormat, CultureInfo.InvariantCulture, DateTimeStyles.None, out _))
                             {
-                                errorMsg = $"条码第 {currentPosition + 1} 位日期格式不正确，期望格式：{expectedFormat}，实际：{segment}";
-                                return false;
+                                return (false, $"条码第 {currentPosition + 1} 位日期格式不正确，期望格式：{expectedFormat}，实际：{segment}");
                             }
                             break;
 
@@ -4554,8 +4756,7 @@ namespace WinformDevFramework.Services.PLCBasic
                             // 流水号验证（指定位数，必须为数字）
                             if (!long.TryParse(segment, out _))
                             {
-                                errorMsg = $"条码第 {currentPosition + 1} 位流水号格式不正确：{segment}";
-                                return false;
+                                return (false, $"条码第 {currentPosition + 1} 位流水号格式不正确：{segment}");
                             }
                             break;
                     }
@@ -4566,17 +4767,16 @@ namespace WinformDevFramework.Services.PLCBasic
                 // 验证总长度
                 if (barcode.Length != barCodeRule.BarCodeLength)
                 {
-                    errorMsg = $"条码长度不正确，期望：{barCodeRule.BarCodeLength}，实际：{barcode.Length}";
-                    return false;
+                    return (false, $"条码长度不正确，期望：{barCodeRule.BarCodeLength}，实际：{barcode.Length}");
                 }
 
-                return true;
+                return (true, string.Empty);
             }
             catch (Exception ex)
             {
-                errorMsg = $"条码验证异常：{ex.Message}";
+                string errorMsg = $"条码验证异常：{ex.Message}";
                 _logger.LogError(ex, errorMsg);
-                return false;
+                return (false, errorMsg);
             }
         }
 
@@ -4615,10 +4815,7 @@ namespace WinformDevFramework.Services.PLCBasic
                     UpdateTime = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")
                 };
 
-                await Task.Run(() =>
-                {
-                    _wipMaterialInfoRepository.Insert(wipMaterialInfo);
-                });
+                await _wipMaterialInfoRepository.InsertAsync(wipMaterialInfo);
 
                 _logger.LogInformation($"添加 WipMaterialInfo 记录成功：BarCode={barcode}, MaterialCode={subpartBarcode}, StationCode={stationCode}, ScanOrder={scanOrder}");
             }
