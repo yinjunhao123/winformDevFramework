@@ -8,7 +8,7 @@ using System.Threading.Tasks;
 namespace PLCBasic
 {
     /// <summary>
-    /// PLC触发采集参数
+    /// PLC采集参数
     /// </summary>
     [SugarTable("PLC_TriggerParam")]
     public partial class PLC_TriggerParam

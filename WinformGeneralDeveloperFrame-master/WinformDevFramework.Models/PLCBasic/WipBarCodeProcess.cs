@@ -20,9 +20,9 @@ namespace PLCBasic
         public string ProductMode { get; set; }
 
         /// <summary>
-        /// 工艺参数版本号
+        /// 程序编码
         /// </summary>
-        public string ProcessVersion { get; set; }
+        public string RecipeCode { get; set; }
 
         /// <summary>
         /// 工站编码

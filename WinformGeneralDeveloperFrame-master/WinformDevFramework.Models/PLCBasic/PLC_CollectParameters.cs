@@ -25,18 +25,9 @@ namespace PLCBasic
         /// </summary>
         public string BarCode { get; set; }
         /// <summary>
-        /// RFID条码编码
-        /// </summary>
-
-        public string RfidBarCode { get; set; }
-        /// <summary>
         /// PLC编码
         /// </summary>
         public string PlcCode { get; set; }
-        /// <summary>
-        /// 设备编号
-        /// </summary>
-        public string EquipmentCode { get; set; }
 
         /// <summary>
         /// 工站编码

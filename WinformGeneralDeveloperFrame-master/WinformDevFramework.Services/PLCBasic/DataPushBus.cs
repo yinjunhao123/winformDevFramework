@@ -119,6 +119,38 @@ namespace WinformDevFramework.Services.PLCBasic
             PartBarcodeCollected?.Invoke(null, new PlcPartBarcodeEventArgs(collectParam));
         }
 
+        #region PLC参数采集更新事件
+
+        /// <summary>
+        /// PLC参数采集更新事件委托
+        /// </summary>
+        public delegate void ParamUpdatedEventHandler(object sender, PlcParamUpdatedEventArgs e);
+
+        /// <summary>
+        /// PLC参数采集更新事件
+        /// UI界面订阅此事件以接收采集到的参数值
+        /// </summary>
+        public static event ParamUpdatedEventHandler ParamUpdated;
+
+        /// <summary>
+        /// 发布PLC参数采集结果
+        /// </summary>
+        /// <param name="stationCode">工站编码</param>
+        /// <param name="plcCode">PLC编码</param>
+        /// <param name="paramValues">参数名值对字典</param>
+        public static void PublishParamUpdated(string stationCode, string plcCode, Dictionary<string, string> paramValues)
+        {
+            ParamUpdated?.Invoke(null, new PlcParamUpdatedEventArgs
+            {
+                StationCode = stationCode,
+                PlcCode = plcCode,
+                ParamValues = paramValues,
+                CollectTime = DateTime.Now
+            });
+        }
+
+        #endregion
+
         #region PLC状态变更事件
 
         /// <summary>
@@ -761,6 +793,32 @@ namespace WinformDevFramework.Services.PLCBasic
         /// 发生时间
         /// </summary>
         public DateTime OccurTime { get; set; }
+    }
+
+    /// <summary>
+    /// PLC参数采集更新事件参数
+    /// </summary>
+    public class PlcParamUpdatedEventArgs : EventArgs
+    {
+        /// <summary>
+        /// 工站编码
+        /// </summary>
+        public string StationCode { get; set; }
+
+        /// <summary>
+        /// PLC编码
+        /// </summary>
+        public string PlcCode { get; set; }
+
+        /// <summary>
+        /// 参数名值对字典
+        /// </summary>
+        public Dictionary<string, string> ParamValues { get; set; }
+
+        /// <summary>
+        /// 采集时间
+        /// </summary>
+        public DateTime CollectTime { get; set; }
     }
 
     #endregion

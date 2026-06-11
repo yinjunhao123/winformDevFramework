@@ -51,6 +51,9 @@ namespace WinformDevFramework.Services.PLCBasic
         private readonly IPLC_ParameterDistributionRecordDetailRepository _parameterDistributionRecordDetailRepository;
         private readonly IWipProcessingIrreversibleRepository _wipProcessingIrreversibleRepository;
         private readonly IWipBarcodeHistoryRepository _wipBarcodeHistoryRepository;
+        private readonly IPLC_TriggerParamRepository _plcTriggerParamRepository;
+        private readonly IPLC_CollectParametersRepository _plcCollectParametersRepository;
+        private readonly IPLC_CollectParametersDetailRepository _plcCollectParametersDetailRepository;
 
         // ============ 心跳服务集成 ============
 
@@ -218,6 +221,8 @@ namespace WinformDevFramework.Services.PLCBasic
             IWipBarcodeHistoryRepository wipBarcodeHistoryRepository,
             IPlcHeartbeatService plcHeartbeatService,
             ISocketCommunicationService socketCommunicationService,
+            IPLC_TriggerParamRepository  pLC_TriggerParamRepository,
+            IPLC_CollectParametersDetailRepository plcCollectParametersDetailRepository,
             ILogger<PLC_TriggerService> logger)
         {
             _plcCommunicationService = plcCommunicationService;
@@ -245,6 +250,8 @@ namespace WinformDevFramework.Services.PLCBasic
             _wipBarcodeHistoryRepository = wipBarcodeHistoryRepository;
             _plcHeartbeatService = plcHeartbeatService;
             _socketCommunicationService = socketCommunicationService;
+            _plcTriggerParamRepository = pLC_TriggerParamRepository;
+            _plcCollectParametersDetailRepository = plcCollectParametersDetailRepository;
             _logger = logger;
 
             // 初始化性能日志记录器
@@ -1550,6 +1557,18 @@ namespace WinformDevFramework.Services.PLCBasic
             }
         }
 
+        /// <summary>
+        /// 异步读取PLC参数值（根据数据类型）
+        /// </summary>
+        /// <param name="plcCode">PLC编码</param>
+        /// <param name="address">地址编码</param>
+        /// <param name="dataType">数据类型</param>
+        /// <returns>参数值字符串</returns>
+        private async Task<string> ReadPlcParamAsync(string plcCode, string address, string dataType)
+        {
+            return await Task.Run(() => ReadPlcData(plcCode, address, dataType));
+        }
+
         #region  批次校验事件处理逻辑
         /// <summary>
         /// 批次校验事件
@@ -1830,7 +1849,6 @@ namespace WinformDevFramework.Services.PLCBasic
                     partType = wipBarcode.ModelCode;
                     RecipeVer = wipBarcode.RecipeCode;
                 }
-
                 int PartStatus=0;
                 bool isRecipeMatch = false;
                 StationProcessInfo stationProcessInfo = null;
@@ -2113,7 +2131,6 @@ namespace WinformDevFramework.Services.PLCBasic
                     msg="参数下发完成";
                     // 发布PLC参数下发事件（下发完成）
                     DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
-
                 }                
                 //成功才写入的数据
                 dataToWrite.Add("PartType", partType);
@@ -2899,11 +2916,11 @@ namespace WinformDevFramework.Services.PLCBasic
                 string subPartID2 = readQualityDataPointsDict.TryGetValue("SubPartID2", out string spid2) ? spid2 : string.Empty;
                 string subPartID3 = readQualityDataPointsDict.TryGetValue("SubPartID3", out string spid3) ? spid3 : string.Empty;
                 string processResult = readQualityDataPointsDict.TryGetValue("PartResult", out string pr) ? pr : string.Empty;
-                string processVersion = readQualityDataPointsDict.TryGetValue("RecipeVer", out string rv) ? rv : string.Empty;
+                string RecipeVer = readQualityDataPointsDict.TryGetValue("RecipeVer", out string rv) ? rv : string.Empty;
                 string testCode = readQualityDataPointsDict.TryGetValue("TestCode", out string tc) ? tc : string.Empty;
                 StationProcessInfo stationProcessInfo = GetStationRecipeCurrent(plcCode, stationCode);
                 WipProcessingIrreversible wipProcessingIrreversible = null;
-                _logger.LogInformation($"采集主条码质量过站数据: ProductMode={productMode}, BarCode={barCode}, SubPartID1={subPartID1},SubPartID2={subPartID2},SubPartID3={subPartID3}, ProcessResult={processResult}, ProcessVersion={processVersion}, TestCode={testCode}");
+                _logger.LogInformation($"采集主条码质量过站数据: ProductMode={productMode}, BarCode={barCode}, SubPartID1={subPartID1},SubPartID2={subPartID2},SubPartID3={subPartID3}, ProcessResult={processResult}, RecipeVer={RecipeVer}, TestCode={testCode}");
                 // 准备写入PLC的数据
                 Dictionary<string, object> dataToWrite = new Dictionary<string, object>();
                 string errorMsg = string.Empty;
@@ -2915,7 +2932,7 @@ namespace WinformDevFramework.Services.PLCBasic
                     DataPushBus.PublishMainPartStationCheck(stationCode, barCode, false, errorMsg);
                     return;
                 }
-
+                //条码不可逆加工验证
                 wipProcessingIrreversible = await _wipProcessingIrreversibleRepository.QueryByClauseAsync(o => o.BarCode == barCode && o.StationCode == stationCode);
                 if (wipProcessingIrreversible != null)
                 {
@@ -2925,9 +2942,7 @@ namespace WinformDevFramework.Services.PLCBasic
 
                    _logger.LogError(errorMsg);
                     return;
-                }
-                
-
+                }               
                 // 验证采集的型号与工站当前生产型号是否一致
                 if (!string.IsNullOrWhiteSpace(productMode))
                 {
@@ -2943,19 +2958,15 @@ namespace WinformDevFramework.Services.PLCBasic
                         }
                     }
                 }
-
                 // 获取该工站需要的零件数量
                 int requiredPartCount = 0;
-
                 requiredPartCount = GetRequiredPartCount(stationCode, stationProcessInfo);
                 _logger.LogInformation($"工站 {stationCode} 需要 {requiredPartCount} 个子零件");
                 
-
                 // 解析子零件数组
                 List<string> collectedSubParts = new List<string>() { subPartID1, subPartID2, subPartID3 };
 
                 // 验证零件数量是否齐全
-
                 if (collectedSubParts.Count < requiredPartCount)
                 {
                     errorMsg = $"零件数量不足，期望 {requiredPartCount} 个，实际 {collectedSubParts.Count} 个";
@@ -2964,30 +2975,73 @@ namespace WinformDevFramework.Services.PLCBasic
                     _logger.LogWarning(errorMsg);
                     return;
                 }
-                
-
                 // 验证零件是否匹配WipMaterialInfo
-                    var existingSubParts = await _wipMaterialInfoRepository.QueryListByClauseAsync(
-                        w => w.BarCode == barCode && w.StationCode == stationCode && w.MaterialType == "SubPart");
-                    var subPartCodes = existingSubParts?.Select(w => w.MaterialCode).ToList() ?? new List<string>();
+                var existingSubParts = await _wipMaterialInfoRepository.QueryListByClauseAsync(
+                    w => w.BarCode == barCode && w.StationCode == stationCode && w.MaterialType == "SubPart");
+                var subPartCodes = existingSubParts?.Select(w => w.MaterialCode).ToList() ?? new List<string>();
 
-                    // 检查采集的零件是否都在WipMaterialInfo中存在
-                    foreach (var subPart in collectedSubParts)
+                // 检查采集的零件是否都在WipMaterialInfo中存在
+                foreach (var subPart in collectedSubParts)
+                {
+                    if (!subPartCodes.Contains(subPart))
                     {
-                        if (!subPartCodes.Contains(subPart))
-                        {
-                            errorMsg = $"采集的零件 {subPart} 与系统记录不匹配";
+                        errorMsg = $"采集的零件 {subPart} 与系统记录不匹配";
                         await WriteErrorStatusToPlc(plcCode, writeDataPoints, 2, errorMsg);
                         DataPushBus.PublishMainPartStationCheck(stationCode, barCode, false, errorMsg);
                         return;
                     }
-                    
+                }
+                //采集收集参数
+                List<PLC_TriggerParam> plcTriggerParams = await _plcTriggerParamRepository.QueryListByClauseAsync(o => o.StationCode == stationCode);
+                
+                // 从PLC读取参数值并保存到字典
+                var collectedParams = new Dictionary<string, string>();
+                foreach (var param in plcTriggerParams)
+                {
+                    try
+                    {
+                        var paramValue = await ReadPlcParamAsync(plcCode, param.AddressCode, param.DataType);
+                        collectedParams[param.ParamName] = paramValue;
+                        _logger.LogDebug($"采集参数成功: ParamName={param.ParamName}, AddressCode={param.AddressCode}, Value={paramValue}");
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, $"采集参数失败: ParamName={param.ParamName}, AddressCode={param.AddressCode}");
+                        collectedParams[param.ParamName] = $"Error: {ex.Message}";
+                    }
+                }
+                // 保存到PLC_CollectParameters主表
+                var collectRecord = new PLC_CollectParameters
+                {
+                    BarCode = barCode,
+                    PlcCode = plcCode,
+                    StationCode = stationCode,
+                    CollectTime = DateTime.Now,
+                    Result = "Success",
+                    Message = $"采集{collectedParams.Count}个参数"
+                };
+                var insertId = await _plcCollectParametersRepository.InsertAsync(collectRecord);
+                collectRecord.ParamID = insertId;
+
+                // 保存到PLC_CollectParametersDetail详情表
+                var detailList = collectedParams.Select(kv => new PLC_CollectParametersDetail
+                {
+                    ParamID = collectRecord.ParamID,
+                    ParamName = kv.Key,
+                    ParamValue = kv.Value
+                }).ToList();
+
+                foreach (var detail in detailList)
+                {
+                    await _plcCollectParametersDetailRepository.InsertAsync(detail);
                 }
 
-                //需要保存质量数据，并且判定上下限是否符合，是否符合质量要求，逻辑后面编写，
+                _logger.LogInformation($"参数采集保存成功: BarCode={barCode}, StationCode={stationCode}, 参数数量={collectedParams.Count}");
 
-                 // 回写PLC：数据采集完成
-                 dataToWrite["BarCodeCollectDone"] = 1;
+                // 通过DataPushBus发布参数采集结果到前端
+                DataPushBus.PublishParamUpdated(stationCode, plcCode, collectedParams);
+                // 回写PLC：数据采集完成
+                dataToWrite["BarCodeCollectDone"] = 1;
                  dataToWrite["BarCodeCollectOK"] = 1;
                  _logger.LogInformation($"主条码过站验证通过: BarCode={barCode}");
                 // 验证通过
@@ -2996,7 +3050,7 @@ namespace WinformDevFramework.Services.PLCBasic
                 {
                     BarCode = barCode,
                     ProductMode = productMode,
-                    ProcessVersion = processVersion,
+                    RecipeCode = RecipeVer,
                     StationCode = stationCode,
                     FirstSubBarCode = collectedSubParts.Count > 0 ? collectedSubParts[0] : string.Empty,
                     SecondSubBarCode = collectedSubParts.Count > 1 ? collectedSubParts[1] : string.Empty,
