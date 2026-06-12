@@ -1122,7 +1122,7 @@ namespace WinformDevFramework.Services.PLCBasic
                         _logger.LogWarning($"连续错误超过10次，增加轮询间隔");
                         PerformanceLogger.Log("TriggerService.PollingLoop", "IncreasedInterval", true);
                         await Task.Delay(_pollingIntervalMs * 5);
-                        continue            ;
+                        continue;
                     }
                 }
                 
