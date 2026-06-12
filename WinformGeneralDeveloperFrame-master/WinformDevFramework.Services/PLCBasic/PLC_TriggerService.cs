@@ -88,8 +88,9 @@ namespace WinformDevFramework.Services.PLCBasic
 
         /// <summary>
         /// MES模式缓存：Key = PlcCode_StationCode，Value = true=MES在线，false=MES离线
+        /// 使用 ConcurrentDictionary 保证线程安全，避免锁竞争
         /// </summary>
-        private readonly Dictionary<string, bool> _mesModeCache = new Dictionary<string, bool>();
+        private readonly ConcurrentDictionary<string, bool> _mesModeCache = new ConcurrentDictionary<string, bool>();
 
         /// <summary>
         /// MES模式地址缓存：Key = PlcCode_StationCode，Value = PLC地址配置
@@ -155,6 +156,23 @@ namespace WinformDevFramework.Services.PLCBasic
         /// 调整冷却时间（秒），两次调整之间至少间隔此时间
         /// </summary>
         private const int AdjustmentCooldownSeconds = 10;
+
+        // ============ 离线模式心跳下发 ============
+
+        /// <summary>
+        /// 心跳交替值缓存：Key = PlcCode_StationCode, Value = 0或1
+        /// </summary>
+        private readonly ConcurrentDictionary<string, int> _heartbeatToggleValues = new ConcurrentDictionary<string, int>();
+
+        /// <summary>
+        /// 离线心跳线程
+        /// </summary>
+        private Thread _heartbeatThread;
+
+        /// <summary>
+        /// 离线心跳间隔（毫秒）
+        /// </summary>
+        private const int HeartbeatIntervalMs = 5000;
 
         // ============ 熔断机制（Circuit Breaker） ============
 
@@ -448,6 +466,12 @@ namespace WinformDevFramework.Services.PLCBasic
             _pollingCancellationToken = new CancellationTokenSource();
             ReloadConfig();
 
+            // 启动离线心跳线程（每5秒执行一次）
+            _heartbeatThread = new Thread(async () => await HeartbeatLoop());
+            _heartbeatThread.IsBackground = true;
+            _heartbeatThread.Name = "PLC_Trigger_Heartbeat";
+            _heartbeatThread.Start();
+
             _pollingThread = new Thread(async () => await PollingLoop());
             _pollingThread.IsBackground = true;
             _pollingThread.Name = "PLC_Trigger_Polling";
@@ -461,6 +485,10 @@ namespace WinformDevFramework.Services.PLCBasic
             _pollingThread?.Join(5000);
             _pollingCancellationToken?.Dispose();
             _pollingCancellationToken = null;
+
+            // 停止离线心跳线程
+            _heartbeatThread?.Join(5000);
+            _logger.LogInformation("离线心跳线程已停止");
         }
 
         public void ReloadConfig()
@@ -844,6 +872,114 @@ namespace WinformDevFramework.Services.PLCBasic
         }
 
         /// <summary>
+        /// 离线心跳循环（参考 PollingLoop 架构模式）
+        /// 每5秒向PLC心跳地址写入0/1交替值
+        /// </summary>
+        private async Task HeartbeatLoop()
+        {
+            _logger.LogInformation("离线心跳线程已启动，间隔: {HeartbeatIntervalMs}ms", HeartbeatIntervalMs);
+
+            while (_isRunning)
+            {
+                try
+                {
+                    await SendOfflineHeartbeatAsync();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "离线心跳循环异常");
+                }
+
+                await Task.Delay(HeartbeatIntervalMs);
+            }
+
+            _logger.LogInformation("离线心跳线程已停止");
+        }
+
+        /// <summary>
+        /// 离线模式心跳下发：向PLC心跳地址写入0/1交替值
+        /// 仅对MES离线模式的工站执行
+        /// </summary>
+        private async Task SendOfflineHeartbeatAsync()
+        {
+            try
+            {
+                // 1. 获取所有MES模式配置
+                List<string> mesModeKeys;
+                lock (_mesModeAddressCache)
+                {
+                    mesModeKeys = _mesModeAddressCache.Keys.ToList();
+                }
+
+                if (!mesModeKeys.Any())
+                    return;
+
+                foreach (var key in mesModeKeys)
+                {
+                    var parts = key.Split('_');
+                    if (parts.Length != 2) continue;
+
+                    string plcCode = parts[0];
+                    string stationCode = parts[1];
+
+                    // 2. 检查是否为MES离线模式（在线模式不需要心跳）
+                    // 使用 ConcurrentDictionary 缓存读取，无锁线程安全
+                    _mesModeCache.TryGetValue(key, out bool isMesOnline);
+                    if (isMesOnline)
+                    {
+                        _logger.LogDebug($"工站 {key} 为MES在线模式，跳过心跳下发");
+                        continue;
+                    }
+
+                    // 3. 检查PLC连接状态
+                    if (!CheckPlcConnectionStatus(plcCode))
+                    {
+                        _logger.LogDebug($"PLC {plcCode} 未连接，跳过心跳下发");
+                        continue;
+                    }
+
+                    // 4. 获取心跳地址（Category = 'Heartbeat'）
+                    var heartbeatAddress = _plcAddressRepository.Query()
+                        .FirstOrDefault(a => a.PlcCode == plcCode 
+                            && a.StationCode == stationCode 
+                            && a.Category == "Heartbeat");
+
+                    if (heartbeatAddress == null)
+                    {
+                        _logger.LogWarning($"未找到心跳地址配置: PlcCode={plcCode}, StationCode={stationCode}");
+                        continue;
+                    }
+
+                    // 5. 0/1交替写入
+                    int currentValue = _heartbeatToggleValues.GetOrAdd(key, 0);
+                    int nextValue = currentValue == 0 ? 1 : 0;
+
+                    try
+                    {
+                        var writeResult = _plcCommunicationService.Write(plcCode, heartbeatAddress.AddressCode, nextValue == 1);
+                        if (writeResult.IsSuccess)
+                        {
+                            _heartbeatToggleValues[key] = nextValue;
+                            _logger.LogDebug($"离线心跳下发成功: {key}, Address={heartbeatAddress.AddressCode}, Value={nextValue}");
+                        }
+                        else
+                        {
+                            _logger.LogWarning($"离线心跳下发失败: {key}, Address={heartbeatAddress.AddressCode}, 错误: {writeResult.Message}");
+                        }
+                    }
+                    catch (Exception writeEx)
+                    {
+                        _logger.LogError(writeEx, $"离线心跳下发异常: {key}, Address={heartbeatAddress.AddressCode}");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "离线心跳下发任务执行失败");
+            }
+        }
+
+        /// <summary>
         /// 根据数据类型读取PLC值
         /// </summary>
         /// <param name="plcCode">PLC编码</param>
@@ -926,7 +1062,7 @@ namespace WinformDevFramework.Services.PLCBasic
             long totalPollCount = 0;
             long totalProcessingTime = 0;
 
-            _logger.LogInformation("PLC轮询线程已启动，初始间隔: {_pollingIntervalMs}ms");
+            _logger.LogInformation($"PLC轮询线程已启动，初始间隔: {_pollingIntervalMs}ms");
             PerformanceLogger.Log("TriggerService.PollingLoop", "Status", "Started");
             PerformanceLogger.Log("TriggerService.PollingLoop", "PollingIntervalMs", _pollingIntervalMs);
 
