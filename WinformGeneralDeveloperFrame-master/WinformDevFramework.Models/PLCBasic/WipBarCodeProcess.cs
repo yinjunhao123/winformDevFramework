@@ -10,9 +10,15 @@ namespace PLCBasic
         public long Id { get; set; }
 
         /// <summary>
-        /// 主条码
+        /// 主零件条码
         /// </summary>
         public string BarCode { get; set; }
+
+
+        /// <summary>
+        /// RFID条码
+        /// </summary>
+        public string RfidCode { get; set; }
 
         /// <summary>
         /// 型号

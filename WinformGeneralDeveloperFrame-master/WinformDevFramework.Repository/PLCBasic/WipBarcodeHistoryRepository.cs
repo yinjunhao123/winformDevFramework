@@ -49,6 +49,7 @@ namespace WinformDevFramework.Repository.PLCBasic
             var history = new WipBarcodeHistory
             {
                 BarCodeId = wipBarCode.Id,
+                RFIDCode = wipBarCode.RFIDCode,
                 BarCode = wipBarCode.BarCode,
                 ModelCode = wipBarCode.ModelCode,
                 BarCodeType = wipBarCode.BarCodeType,
@@ -64,7 +65,6 @@ namespace WinformDevFramework.Repository.PLCBasic
                 PrStationCode = wipBarCode.PrStationCode,
                 NextStationCode = wipBarCode.NextStationCode,
                 BatchCode = wipBarCode.BatchCode,
-                IsRepair = wipBarCode.RepairCount, // 默认非返修
                 OperationType = operationType,
                 SnapshotTime = DateTime.Now
             };

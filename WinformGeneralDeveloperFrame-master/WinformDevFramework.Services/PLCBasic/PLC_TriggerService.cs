@@ -1807,7 +1807,7 @@ namespace WinformDevFramework.Services.PLCBasic
                 Dictionary<string, object> dataToWrite = new Dictionary<string, object>();
                 //型号
                 string partType = readDataPointsDict.ContainsKey("PartType") ? readDataPointsDict["PartType"] : string.Empty;
-                //主条码信息
+                //RFID条码信息
                 string partId = readDataPointsDict.ContainsKey("PartID") ? readDataPointsDict["PartID"] : string.Empty;
                 //批次号码
                 string batchCheckId = readDataPointsDict.ContainsKey("BatchCheckID") ? readDataPointsDict["BatchCheckID"] : string.Empty;
@@ -1836,7 +1836,7 @@ namespace WinformDevFramework.Services.PLCBasic
                         DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
                         return;
                     }
-                    wipBarcode = await _wipBarcodeRepository.QueryByClauseAsync(o => o.BarCode == material.BarCode);
+                    wipBarcode = await _wipBarcodeRepository.QueryByClauseAsync(o => o.RFIDCode == material.RfidCode);
                     if(wipBarcode == null)
                     {
                         msg = $"未找到主条码信息: 子条码={suPartId}";
@@ -1844,7 +1844,7 @@ namespace WinformDevFramework.Services.PLCBasic
                         DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
                         return;
                     }
-                    //创建新主条码
+                    //创建新RFID条码
                     partId = await GenerateBarcode(stationCode);
                     partType = wipBarcode.ModelCode;
                     RecipeVer = wipBarcode.RecipeCode;
@@ -1867,7 +1867,7 @@ namespace WinformDevFramework.Services.PLCBasic
                             return;
                         }
                         partType = parameterDistribution.ProductModelCode;
-                        //重新生成条码
+                        //重新生成RFID条码
                         partId = await GenerateBarcode(stationCode);
 
                     }
@@ -1891,13 +1891,12 @@ namespace WinformDevFramework.Services.PLCBasic
                         }
                         if (string.IsNullOrEmpty(partId))
                         {
-                            msg = $"{stationCode}工站未传递条码信息";
+                            msg = $"{stationCode}工站未传递RFID条码信息";
                             await ErrorMsg(plcCode, stationCode, partId, msg, 4, writeDataPoints, dataToWrite);
                             DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
                             return;
                         }
-
-                        wipBarcode = await _wipBarcodeRepository.QueryByClauseAsync(o => o.ModelCode == partType && o.RecipeCode == RecipeVer && o.BarCode == partId);
+                        wipBarcode = await _wipBarcodeRepository.QueryByClauseAsync(o => o.ModelCode == partType && o.RecipeCode == RecipeVer && o.RFIDCode == partId);
                         if (wipBarcode == null)
                         {
                             msg = $"{stationCode}工站{partId}条码没有在制信息";
@@ -1913,11 +1912,11 @@ namespace WinformDevFramework.Services.PLCBasic
                             return;
                         }
                     }
-                    var process = await _wipBarCodeProcessRepository.QueryByClauseAsync(o => o.BarCode == partId && o.StationCode == stationCode);
+                    //不可逆信息
+                    var process = await _wipBarCodeProcessRepository.QueryByClauseAsync(o => o.RfidCode == partId && o.StationCode == stationCode);
                     if (process == null)
                     {
                         msg = $"该条码{partId}在工站{stationCode}有不可逆信息";
-
                         await ErrorMsg(plcCode, stationCode, partId, msg, 6, writeDataPoints, dataToWrite);
                         DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
                         return;
@@ -2165,10 +2164,23 @@ namespace WinformDevFramework.Services.PLCBasic
                     {
                         // 1. 保存原主条码的历史记录
                         await _wipBarcodeHistoryRepository.SaveHistoryAsync(wipBarcode, "Repair");
-                        _logger.LogInformation($"返修-保存原主条码历史记录: OldBarCode={wipBarcode.BarCode}, NewBarCode={partId}");
+                        _logger.LogInformation($"返修-保存原主条码历史记录: OldBarCode={wipBarcode.RFIDCode}, NewBarCode={partId}");
 
-                        // 2. 更新主条码表的 Barcode 字段为新条码 partId
-                        wipBarcode.BarCode = partId;
+                        // 2. 更新 WipMaterialInfo 表中所有 BarCode 等于原主条码的记录
+                        string oldBarCode = wipBarcode.RFIDCode;
+                        var materialList = await _wipMaterialInfoRepository.QueryListByClauseAsync(m => m.RfidCode == oldBarCode);
+                        if (materialList != null && materialList.Count > 0)
+                        {
+                            foreach (var mat in materialList)
+                            {
+                                mat.RfidCode = partId;
+                            }
+                            await _wipMaterialInfoRepository.UpdateAsync(materialList);
+                            _logger.LogInformation($"返修-批量更新子零件关联主条码: Count={materialList.Count}, OldBarCode={oldBarCode}, NewBarCode={partId}");
+                        }
+
+                        // 3. 更新主条码表的 Barcode 字段为新条码 partId
+                        wipBarcode.RFIDCode = partId;
                         wipBarcode.InputTime = DateTime.Now;
                         wipBarcode.OutputTime = null;
                         wipBarcode.StationCode = stationCode;
@@ -2178,22 +2190,6 @@ namespace WinformDevFramework.Services.PLCBasic
                         wipBarcode.UpdateTime = DateTime.Now;
                         await _wipBarcodeRepository.UpdateAsync (wipBarcode);
                         _logger.LogInformation($"返修-更新主条码: BarCode={partId}, RepairCount={wipBarcode.RepairCount}");
-
-                        // 3. 更新 WipMaterialInfo 表中所有 BarCode 等于原主条码的记录
-                        string oldBarCode = wipBarcode.BarCode;
-                        var materialList = await _wipMaterialInfoRepository.QueryListByClauseAsync(m => m.BarCode == oldBarCode);
-
-                        if (materialList != null && materialList.Count > 0)
-                        {
-                            foreach (var mat in materialList)
-                            {
-                                mat.BarCode = partId;
-                                mat.UpdateTime = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
-                                mat.UpdateUser = "system";
-                            }
-                            await _wipMaterialInfoRepository.UpdateAsync(materialList);
-                            _logger.LogInformation($"返修-批量更新子零件关联主条码: Count={materialList.Count}, OldBarCode={oldBarCode}, NewBarCode={partId}");
-                        }
                     }
                     catch (Exception ex)
                     {
@@ -2212,7 +2208,6 @@ namespace WinformDevFramework.Services.PLCBasic
                     DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
                     _logger.LogWarning($"发布主零件进站失败事件: StationCode={stationCode}, Barcode={partId}, Error={msg}");
                 }
-
             }
             catch (Exception ex)
             {
@@ -2395,6 +2390,7 @@ namespace WinformDevFramework.Services.PLCBasic
         private async Task SubCheckInWriteToPLCAsync(string plcCode, string stationCode, List<PLC_Event_Data_Detail> writeDataPoints, Dictionary<string, string> readDataPointsDict)
         {
             string subpartId = readDataPointsDict.ContainsKey("SubPartID") ? readDataPointsDict["SubPartID"] : string.Empty;
+            //rfid条码
             string partId = readDataPointsDict.ContainsKey("PartID") ? readDataPointsDict["PartID"] : string.Empty;
             string partType = readDataPointsDict.ContainsKey("PartType") ? readDataPointsDict["PartType"] : string.Empty;
             Dictionary<string, object> dataToWrite = new Dictionary<string, object>();
@@ -2426,9 +2422,16 @@ namespace WinformDevFramework.Services.PLCBasic
                     DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
                     return;
                 }
-
-                 // 从型号获取工艺路线
-                 var productModelInfo = stationProcessInfo.RoutingList.FirstOrDefault(o => o.StationCode == stationCode);
+                var wipBarcode = await _wipBarcodeRepository.QueryByClauseAsync(o => o.RFIDCode == partId && o.StationCode == stationCode);
+                if (wipBarcode == null)
+                {
+                    msg = $"未找到RFID条码 {partId} 对应的在制品信息";
+                    await SuCheckErrorMsg(plcCode, stationCode, partId, subpartId, msg, 101, writeDataPoints, dataToWrite);
+                    DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
+                    return;
+                }
+                // 从型号获取工艺路线
+                var productModelInfo = stationProcessInfo.RoutingList.FirstOrDefault(o => o.StationCode == stationCode);
                  if (productModelInfo != null)
                  {
 
@@ -2451,7 +2454,7 @@ namespace WinformDevFramework.Services.PLCBasic
                 // 验证子零件是否已存在（避免重复扫描）
                 if (string.IsNullOrEmpty(msg))
                 {
-                    var existingCount = await _wipMaterialInfoRepository.QueryByClauseAsync(w => w.BarCode == partId && w.StationCode == stationCode && w.MaterialCode == subpartId);
+                    var existingCount = await _wipMaterialInfoRepository.QueryByClauseAsync(w => w.RfidCode == partId && w.StationCode == stationCode && w.MaterialCode == subpartId);
 
                     if (existingCount !=null)
                     {
@@ -2465,7 +2468,7 @@ namespace WinformDevFramework.Services.PLCBasic
                 int scannedCount = 0;
                 if (string.IsNullOrEmpty(msg))
                 {
-                    scannedCount = await _wipMaterialInfoRepository.GetCountAsync(w => w.BarCode == partId && w.StationCode == stationCode && w.MaterialType == "SubPart");
+                    scannedCount = await _wipMaterialInfoRepository.GetCountAsync(w => w.RfidCode == partId && w.StationCode == stationCode && w.MaterialType == "SubPart");
 
                     _logger.LogInformation($"主条码 {partId} 在工站 {stationCode} 已扫描 {scannedCount} 个子零件");
                 }
@@ -2479,8 +2482,7 @@ namespace WinformDevFramework.Services.PLCBasic
                     await SuCheckErrorMsg(plcCode, stationCode, partId, subpartId, msg, 101, writeDataPoints, dataToWrite);
                     DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
                     return;
-                }
-                
+                }                
                 // 计算当前子零件序号
                 int num = scannedCount + 1;
 
@@ -2505,7 +2507,7 @@ namespace WinformDevFramework.Services.PLCBasic
                     return;
                 }
                 // PLC 操作完成后，添加 WipMaterialInfo 记录
-                await AddWipMaterialInfoAsync(partId, stationProcessInfo, stationCode, subpartId, num);                
+                await AddWipMaterialInfoAsync(partId, stationProcessInfo, stationCode, subpartId, num, wipBarcode);                
                 // 发布子零件绑定事件到前端监控
                 string partName = $"第{num}个子零件";
                 if (string.IsNullOrEmpty(msg))
@@ -2731,7 +2733,22 @@ namespace WinformDevFramework.Services.PLCBasic
                     return;
                 }
 
-                var process= await _wipProcessingIrreversibleRepository.QueryByClauseAsync(o=>o.BarCode==processingPartId&&o.StationCode==stationCode);
+                var wipBarcode= await _wipBarcodeRepository.QueryByClauseAsync(o => o.RFIDCode == processingPartId && o.StationCode == stationCode);
+                if (wipBarcode == null)
+                {
+                    msg = $"条码 {processingPartId} 在工站 {stationCode} 没有在制信息";
+                    _logger.LogWarning(msg);
+                    // 向PLC下发错误状态（带重试机制）
+                    dataToWrite.Add("ProcessingDone", false);
+                    dataToWrite.Add("ProcessingErrorMsg", msg);
+                    dataToWrite.Add("ProcessingErrorCode", 102);
+                    await WriteDataPointsToPlc(plcCode, writeDataPoints, dataToWrite);
+                    DataPushBus.PublishMainPartStationCheck(stationCode, processingPartId, false, msg);
+                    _logger.LogInformation($"向PLC下发错误状态: ProcessingDone=false, ProcessingErrorCode=102");
+                    return;
+                }
+
+                var process= await _wipProcessingIrreversibleRepository.QueryByClauseAsync(o=>o.RFIDCode==processingPartId&&o.StationCode==stationCode);
                 if (process != null)
                 {
                     msg = $"条码 {processingPartId} 在工站 {stationCode} 已存在不可逆加工记录，跳过处理";
@@ -2756,7 +2773,8 @@ namespace WinformDevFramework.Services.PLCBasic
                 // 将信息新增到不可逆加工标记表
                 var irreversibleRecord = new WipProcessingIrreversible
                 {
-                    BarCode = processingPartId,
+                    BarCode=wipBarcode.BarCode,
+                    RFIDCode = processingPartId,
                     ProductModel = productModel,
                     StationCode = stationCode,
                     RecipeCode = recipeCode,
@@ -2911,7 +2929,7 @@ namespace WinformDevFramework.Services.PLCBasic
             {
                 // 质量采集数据
                 string productMode = readQualityDataPointsDict.TryGetValue("PartType", out string pt) ? pt : string.Empty;
-                string barCode = readQualityDataPointsDict.TryGetValue("PartID", out string pid) ? pid : string.Empty;
+                string RFIDCode = readQualityDataPointsDict.TryGetValue("PartID", out string pid) ? pid : string.Empty;
                 string subPartID1 = readQualityDataPointsDict.TryGetValue("SubPartID1", out string spid1) ? spid1 : string.Empty;
                 string subPartID2 = readQualityDataPointsDict.TryGetValue("SubPartID2", out string spid2) ? spid2 : string.Empty;
                 string subPartID3 = readQualityDataPointsDict.TryGetValue("SubPartID3", out string spid3) ? spid3 : string.Empty;
@@ -2920,29 +2938,40 @@ namespace WinformDevFramework.Services.PLCBasic
                 string testCode = readQualityDataPointsDict.TryGetValue("TestCode", out string tc) ? tc : string.Empty;
                 StationProcessInfo stationProcessInfo = GetStationRecipeCurrent(plcCode, stationCode);
                 WipProcessingIrreversible wipProcessingIrreversible = null;
-                _logger.LogInformation($"采集主条码质量过站数据: ProductMode={productMode}, BarCode={barCode}, SubPartID1={subPartID1},SubPartID2={subPartID2},SubPartID3={subPartID3}, ProcessResult={processResult}, RecipeVer={RecipeVer}, TestCode={testCode}");
+                _logger.LogInformation($"采集主条码质量过站数据: ProductMode={productMode}, RFIDCode={RFIDCode}, SubPartID1={subPartID1},SubPartID2={subPartID2},SubPartID3={subPartID3}, ProcessResult={processResult}, RecipeVer={RecipeVer}, TestCode={testCode}");
                 // 准备写入PLC的数据
                 Dictionary<string, object> dataToWrite = new Dictionary<string, object>();
                 string errorMsg = string.Empty;
                 // 验证主条码是否为空
-                if (string.IsNullOrWhiteSpace(barCode))
+                if (string.IsNullOrWhiteSpace(RFIDCode))
                 {
-                    errorMsg = "主条码为空";
+                    errorMsg = "RFID主条码为空";
                     await WriteErrorStatusToPlc(plcCode, writeDataPoints, 2, errorMsg);
-                    DataPushBus.PublishMainPartStationCheck(stationCode, barCode, false, errorMsg);
+                    DataPushBus.PublishMainPartStationCheck(stationCode, RFIDCode, false, errorMsg);
                     return;
                 }
-                //条码不可逆加工验证
-                wipProcessingIrreversible = await _wipProcessingIrreversibleRepository.QueryByClauseAsync(o => o.BarCode == barCode && o.StationCode == stationCode);
-                if (wipProcessingIrreversible != null)
-                {
-                    errorMsg = $"条码 [{barCode}] 已处理，不能重复处理";
-                    await WriteErrorStatusToPlc(plcCode, writeDataPoints, 2, errorMsg);
-                    DataPushBus.PublishMainPartStationCheck(stationCode, barCode, false, errorMsg);
+                //条码不可逆加工验证  待确定是否需要放在这里验证，还是只要在加工事件中记录不可逆加工状态即可
 
-                   _logger.LogError(errorMsg);
+                //wipProcessingIrreversible = await _wipProcessingIrreversibleRepository.QueryByClauseAsync(o => o.RFIDCode == RFIDCode && o.StationCode == stationCode);
+                //if (wipProcessingIrreversible != null)
+                //{
+                //    errorMsg = $"条码 [{RFIDCode}] 已处理，不能重复处理";
+                //    await WriteErrorStatusToPlc(plcCode, writeDataPoints, 2, errorMsg);
+                //    DataPushBus.PublishMainPartStationCheck(stationCode, RFIDCode, false, errorMsg);
+
+                //   _logger.LogError(errorMsg);
+                //    return;
+                //}               
+                //验证是否有在制信息
+                 var wipBarcode = await _wipBarcodeRepository.QueryByClauseAsync(o => o.RFIDCode == RFIDCode && o.StationCode == stationCode);
+                if(wipBarcode == null)
+                {
+                    errorMsg = $"未找到RFID条码 {RFIDCode} 对应的在制品信息";
+                    await WriteErrorStatusToPlc(plcCode, writeDataPoints, 2, errorMsg);
+                    DataPushBus.PublishMainPartStationCheck(stationCode, RFIDCode, false, errorMsg);
+                    _logger.LogError(errorMsg);
                     return;
-                }               
+                }
                 // 验证采集的型号与工站当前生产型号是否一致
                 if (!string.IsNullOrWhiteSpace(productMode))
                 {
@@ -2952,7 +2981,7 @@ namespace WinformDevFramework.Services.PLCBasic
                         {
                             errorMsg = $"采集型号 [{productMode}] 与工站当前生产型号 [{stationProcessInfo.ProductModel}] 不一致";
                             await WriteErrorStatusToPlc(plcCode, writeDataPoints, 2, errorMsg);
-                            DataPushBus.PublishMainPartStationCheck(stationCode, barCode, false, errorMsg);
+                            DataPushBus.PublishMainPartStationCheck(stationCode, RFIDCode, false, errorMsg);
                             _logger.LogError(errorMsg);
                             return;
                         }
@@ -2971,13 +3000,13 @@ namespace WinformDevFramework.Services.PLCBasic
                 {
                     errorMsg = $"零件数量不足，期望 {requiredPartCount} 个，实际 {collectedSubParts.Count} 个";
                     await WriteErrorStatusToPlc(plcCode, writeDataPoints, 2, errorMsg);
-                    DataPushBus.PublishMainPartStationCheck(stationCode, barCode, false, errorMsg);
+                    DataPushBus.PublishMainPartStationCheck(stationCode, RFIDCode, false, errorMsg);
                     _logger.LogWarning(errorMsg);
                     return;
                 }
                 // 验证零件是否匹配WipMaterialInfo
                 var existingSubParts = await _wipMaterialInfoRepository.QueryListByClauseAsync(
-                    w => w.BarCode == barCode && w.StationCode == stationCode && w.MaterialType == "SubPart");
+                    w => w.RfidCode == RFIDCode && w.StationCode == stationCode && w.MaterialType == "SubPart");
                 var subPartCodes = existingSubParts?.Select(w => w.MaterialCode).ToList() ?? new List<string>();
 
                 // 检查采集的零件是否都在WipMaterialInfo中存在
@@ -2987,7 +3016,7 @@ namespace WinformDevFramework.Services.PLCBasic
                     {
                         errorMsg = $"采集的零件 {subPart} 与系统记录不匹配";
                         await WriteErrorStatusToPlc(plcCode, writeDataPoints, 2, errorMsg);
-                        DataPushBus.PublishMainPartStationCheck(stationCode, barCode, false, errorMsg);
+                        DataPushBus.PublishMainPartStationCheck(stationCode, RFIDCode, false, errorMsg);
                         return;
                     }
                 }
@@ -3013,7 +3042,8 @@ namespace WinformDevFramework.Services.PLCBasic
                 // 保存到PLC_CollectParameters主表
                 var collectRecord = new PLC_CollectParameters
                 {
-                    BarCode = barCode,
+                    BarCode = wipBarcode.BarCode,
+                    RFIDCode = RFIDCode,
                     PlcCode = plcCode,
                     StationCode = stationCode,
                     CollectTime = DateTime.Now,
@@ -3036,19 +3066,20 @@ namespace WinformDevFramework.Services.PLCBasic
                     await _plcCollectParametersDetailRepository.InsertAsync(detail);
                 }
 
-                _logger.LogInformation($"参数采集保存成功: BarCode={barCode}, StationCode={stationCode}, 参数数量={collectedParams.Count}");
+                _logger.LogInformation($"参数采集保存成功: RFIDCode={RFIDCode}, StationCode={stationCode}, 参数数量={collectedParams.Count}");
 
                 // 通过DataPushBus发布参数采集结果到前端
                 DataPushBus.PublishParamUpdated(stationCode, plcCode, collectedParams);
                 // 回写PLC：数据采集完成
                 dataToWrite["BarCodeCollectDone"] = 1;
                  dataToWrite["BarCodeCollectOK"] = 1;
-                 _logger.LogInformation($"主条码过站验证通过: BarCode={barCode}");
+                 _logger.LogInformation($"主条码过站验证通过: RFIDCode={RFIDCode}");
                 // 验证通过
                 // 保存过站记录到WipBarCodeProcess表 结果数据
                 var processRecord = new WipBarCodeProcess
                 {
-                    BarCode = barCode,
+                    RfidCode=RFIDCode,
+                    BarCode = wipBarcode.BarCode,
                     ProductMode = productMode,
                     RecipeCode = RecipeVer,
                     StationCode = stationCode,
@@ -3062,11 +3093,11 @@ namespace WinformDevFramework.Services.PLCBasic
                 };
                 await _wipBarCodeProcessRepository.InsertAsync(processRecord);
                 // 更新WipBarCode表
-                await UpdateWipBarCodeStatus(barCode, stationCode);
+                await UpdateWipBarCodeStatus(RFIDCode, stationCode);
                 await WriteDataPointsToPlc(plcCode, writeDataPoints, dataToWrite);
 
                 // 写入PLC响应
-                DataPushBus.PublishMainPartStationCheck(stationCode, barCode, true, "主条码过站验证通过");
+                DataPushBus.PublishMainPartStationCheck(stationCode, RFIDCode, true, "主条码过站验证通过");
 
             }
             catch (Exception ex)
@@ -3955,7 +3986,7 @@ namespace WinformDevFramework.Services.PLCBasic
                     return;
                 }
 
-                var existingBarcode = await _wipBarcodeRepository.QueryByClauseAsync(o => o.BarCode == barCode);
+                var existingBarcode = await _wipBarcodeRepository.QueryByClauseAsync(o => o.RFIDCode == barCode);
                 DateTime now = DateTime.Now;
 
                 if (existingBarcode == null)
@@ -3963,7 +3994,7 @@ namespace WinformDevFramework.Services.PLCBasic
                     // 新增数据
                     var newBarcode = new WipBarCode
                     {
-                        BarCode = barCode,
+                        RFIDCode = barCode,
                         ModelCode = modelCode,
                         BarCodeType = "2",
                         Status = 0,
@@ -4188,27 +4219,26 @@ namespace WinformDevFramework.Services.PLCBasic
         /// <summary>
         /// 更新WipBarCode表状态
         /// </summary>
-        private async Task UpdateWipBarCodeStatus(string barCode, string stationCode)
+        private async Task UpdateWipBarCodeStatus(string RFIDCode, string stationCode)
         {
             try
             {
-                var wipBarCode = await _wipBarcodeRepository.QueryByClauseAsync(o => o.BarCode == barCode && o.StationCode == stationCode);
-
+                var wipBarCode = await _wipBarcodeRepository.QueryByClauseAsync(o => o.RFIDCode == RFIDCode && o.StationCode == stationCode);
                 if (wipBarCode != null)
                 {
                     // 先保存历史记录
                     await _wipBarcodeHistoryRepository.SaveHistoryAsync(wipBarCode, "UpdateStatus");
-                    _logger.LogInformation($"保存WipBarCode历史记录: BarCode={barCode}, StationCode={stationCode}");
+                    _logger.LogInformation($"保存WipBarCode历史记录: RFIDCode={RFIDCode}, StationCode={stationCode}");
 
                     wipBarCode.BarCodeType = "0";
                     wipBarCode.OutputTime = DateTime.Now;
                     await _wipBarcodeRepository.UpdateAsync (wipBarCode);
-                    _logger.LogInformation($"更新WipBarCode状态: BarCode={barCode}, StationCode={stationCode}, BarCodeType=0, OutputTime={wipBarCode.OutputTime}");
+                    _logger.LogInformation($"更新WipBarCode状态: RFIDCode={RFIDCode}, StationCode={stationCode}, BarCodeType=0, OutputTime={wipBarCode.OutputTime}");
                 }
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, $"更新WipBarCode状态失败: BarCode={barCode}");
+                _logger.LogError(ex, $"更新WipBarCode状态失败: RFIDCode={RFIDCode}");
             }
         }
 
@@ -4837,45 +4867,51 @@ namespace WinformDevFramework.Services.PLCBasic
         /// <summary>
         /// 添加 WipMaterialInfo 记录
         /// </summary>
-        private async Task AddWipMaterialInfoAsync(string barcode, StationProcessInfo stationProcessInfo, string stationCode, string subpartBarcode, int scanOrder)
+        private async Task AddWipMaterialInfoAsync(string RFIDcode, StationProcessInfo stationProcessInfo, string stationCode, string subpartBarcode, int scanOrder, WipBarCode wipBarcode)
         {
             try
             {
                 // 获取当前工站的条码规则名称
-                string ruleName = string.Empty;
+                string PartsName = string.Empty;
 
                 var stationConfig = stationProcessInfo.RoutingList.FirstOrDefault(rl => rl.StationCode == stationCode);
                 if (stationConfig != null)
                 {
-                    ruleName = scanOrder switch
+                    PartsName = scanOrder switch
                     {
-                        1 => stationConfig.FirstPartsRule,
-                        2 => stationConfig.SecondPartsRule,
-                        3 => stationConfig.ThirdPartsRule,
+                        1 => stationConfig.FirstPartsName,
+                        2 => stationConfig.SecondPartsName,
+                        3 => stationConfig.ThirdPartsName,
                         _ => string.Empty
                     };
                 }
                 var wipMaterialInfo = new WipMaterialInfo
                 {
                     MaterialInfoId = Guid.NewGuid().ToString("N"),
-                    BarCode = barcode,
+                    RfidCode = RFIDcode,
                     MaterialCode = subpartBarcode,
                     MaterialType = "SubPart",
                     StationCode = stationCode,
-                    BarCodeRuleName = ruleName,
+                    MaterialName = PartsName,
                     CreateUser = "system",
-                    CreateTime = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
-                    UpdateUser = "system",
-                    UpdateTime = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")
+                    CreateTime = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")
                 };
 
                 await _wipMaterialInfoRepository.InsertAsync(wipMaterialInfo);
 
-                _logger.LogInformation($"添加 WipMaterialInfo 记录成功：BarCode={barcode}, MaterialCode={subpartBarcode}, StationCode={stationCode}, ScanOrder={scanOrder}");
+                if(stationCode== "OP05-1A"&& scanOrder==2)
+                {
+                    //主条码是盖子，对应第二个子零件条码是盖盖
+                    wipBarcode.BarCode = subpartBarcode;
+                    await _wipBarcodeRepository.UpdateAsync(wipBarcode);
+                }
+
+
+                _logger.LogInformation($"添加 WipMaterialInfo 记录成功:RFIDCode={RFIDcode}, MaterialCode={subpartBarcode}, StationCode={stationCode}, ScanOrder={scanOrder}");
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, $"添加 WipMaterialInfo 记录失败：BarCode={barcode}, MaterialCode={subpartBarcode}");
+                _logger.LogError(ex, $"添加 WipMaterialInfo 记录失败：RFIDCode={RFIDcode}, MaterialCode={subpartBarcode}");
                 throw;
             }
         }

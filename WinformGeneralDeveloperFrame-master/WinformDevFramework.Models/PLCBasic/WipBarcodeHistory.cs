@@ -18,14 +18,15 @@ namespace PLCBasic
         public long BarCodeId { get; set; }
 
         /// <summary>
+        /// RFID条码
+        /// </summary>
+        public string RFIDCode { get; set; }
+
+        /// <summary>
         /// 条码
         /// </summary>
         public string BarCode { get; set; }
 
-        /// <summary>
-        /// RFID编码
-        /// </summary>
-        public string RfidCode { get; set; }
 
         /// <summary>
         /// 型号编码
@@ -97,10 +98,6 @@ namespace PLCBasic
         /// </summary>
         public string BatchCode { get; set; }
 
-        /// <summary>
-        /// 是否返修
-        /// </summary>
-        public int? IsRepair { get; set; }
 
         /// <summary>
         /// 操作类型

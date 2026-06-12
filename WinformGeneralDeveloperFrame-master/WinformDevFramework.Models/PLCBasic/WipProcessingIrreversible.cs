@@ -9,6 +9,9 @@ namespace PLCBasic
         [SugarColumn(IsPrimaryKey = true, IsIdentity = true)]
         public long Id { get; set; }
 
+
+        public string RFIDCode {  get; set; }
+
         /// <summary>
         /// 不可逆条码（加工条码）
         /// </summary>

@@ -21,6 +21,11 @@ namespace PLCBasic
         [SugarColumn(IsPrimaryKey = true, IsIdentity = true)]
         public long ParamID { get; set; }
         /// <summary>
+        /// 主条码RFID
+        /// </summary>
+        public string RFIDCode { get; set; }
+
+        /// <summary>
         /// 条码编码
         /// </summary>
         public string BarCode { get; set; }

@@ -17,11 +17,6 @@ namespace PLCBasic
         public string RfidCode { get; set; }
 
         /// <summary>
-        /// 条码
-        /// </summary>
-        public string BarCode { get; set; }
-
-        /// <summary>
         /// 物料编码
         /// </summary>
         public string MaterialCode { get; set; }
@@ -37,9 +32,9 @@ namespace PLCBasic
         public string StationCode { get; set; }
 
         /// <summary>
-        /// 条码规则名称
+        /// 物料名称
         /// </summary>
-        public string BarCodeRuleName { get; set; }
+        public string MaterialName { get; set; }
 
         /// <summary>
         /// 创建时间
@@ -51,14 +46,5 @@ namespace PLCBasic
         /// </summary>
         public string CreateUser { get; set; }
 
-        /// <summary>
-        /// 更新时间
-        /// </summary>
-        public string UpdateTime { get; set; }
-
-        /// <summary>
-        /// 更新用户
-        /// </summary>
-        public string UpdateUser { get; set; }
     }
 }
