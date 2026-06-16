@@ -41,6 +41,9 @@ namespace WinformDevFramework.IServices.PLCBasic
         OperateResult<float> ReadFloat(string plcCode, string address);
         OperateResult<string> ReadString(string plcCode, string address, ushort length);
 
+        OperateResult<byte> ReadByte(string plcCode, string address); 
+
+
         /// <summary>
         /// 批量读取多个布尔地址
         /// </summary>
@@ -69,6 +72,13 @@ namespace WinformDevFramework.IServices.PLCBasic
         void InitializeConnections();
         void Cleanup();
         int GetAddressBitOffset(string address);
+        
+        /// <summary>
+        /// 重新连接指定的PLC
+        /// </summary>
+        /// <param name="plcCode">PLC编码</param>
+        /// <returns>是否重连成功</returns>
+        Task<bool> ReconnectAsync(string plcCode);
     }
 }
 

@@ -36,11 +36,6 @@ namespace PLCBasic
         public string RecipeCode { get; set; }
 
         /// <summary>
-        /// 版本号
-        /// </summary>
-        public string Version { get; set; }
-
-        /// <summary>
         /// 快照时间（即下发前保存的时间）
         /// </summary>
         public DateTime? SnapshotTime { get; set; }

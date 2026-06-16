@@ -45,7 +45,7 @@ namespace PLCBasic
         public string AddressType { get; set; }
 
         /// <summary>
-        /// Desc:数据类型 (如: Bool, Int, Float, String)
+        /// Desc:数据类型 (如: Bool, Int, Float, String,Short,Double)
         /// Default:
         /// Nullable:False
         /// </summary>           

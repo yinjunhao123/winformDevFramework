@@ -89,24 +89,36 @@ namespace WinformDevFramework.Services.PLCBasic
                 case "siemens":
                     _siemensClient = new SiemensS7Net(SiemensPLCS.S1500, ipAddress);
                     _siemensClient.Port = port;
+                    // 设置超时时间：连接超时3秒，接收超时3秒，快速检测断线
+                    _siemensClient.ConnectTimeOut = 3000;
+                    _siemensClient.ReceiveTimeOut = 3000;
                     break;
                 case "fx":
                 case "mitsubishi":
                 case "melsec":
                     _mitsubishiClient = new MelsecMcNet(ipAddress, port);
+                    // 设置超时时间：连接超时3秒，接收超时3秒，快速检测断线
+                    _mitsubishiClient.ConnectTimeOut = 3000;
+                    _mitsubishiClient.ReceiveTimeOut = 3000;
                     break;
                 case "modbus":
                     _modbusClient = new HslCommunication.ModBus.ModbusTcpNet(ipAddress, port);
+                    // 设置超时时间：连接超时3秒，接收超时3秒，快速检测断线
+                    _modbusClient.ConnectTimeOut = 3000;
+                    _modbusClient.ReceiveTimeOut = 3000;
                     break;
                 default:
                     _siemensClient = new SiemensS7Net(SiemensPLCS.S1500, ipAddress);
                     _siemensClient.Port = port;
+                    // 设置超时时间：连接超时3秒，接收超时3秒，快速检测断线
+                    _siemensClient.ConnectTimeOut = 3000;
+                    _siemensClient.ReceiveTimeOut = 3000;
                     break;
             }
         }
 
         /// <summary>
-        /// 建立PLC连接
+        /// 建立PLC连接（带3秒超时控制）
         /// </summary>
         /// <returns>连接操作结果</returns>
         public OperateResult Connect()
@@ -116,18 +128,37 @@ namespace WinformDevFramework.Services.PLCBasic
                 try
                 {
                     OperateResult result = null;
+                    
+                    // 使用 Task 包装连接操作，强制 3 秒超时
+                    var connectTask = Task.Run(() =>
+                    {
+                        if (_siemensClient != null)
+                        {
+                            return _siemensClient.ConnectServer();
+                        }
+                        else if (_mitsubishiClient != null)
+                        {
+                            return _mitsubishiClient.ConnectServer();
+                        }
+                        else if (_modbusClient != null)
+                        {
+                            return _modbusClient.ConnectServer();
+                        }
+                        return new OperateResult("未初始化客户端");
+                    });
 
-                    if (_siemensClient != null)
+                    // 等待最多3秒
+                    if (connectTask.Wait(3000))
                     {
-                        result = _siemensClient.ConnectServer();
+                        result = connectTask.Result;
                     }
-                    else if (_mitsubishiClient != null)
+                    else
                     {
-                        result = _mitsubishiClient.ConnectServer();
-                    }
-                    else if (_modbusClient != null)
-                    {
-                        result = _modbusClient.ConnectServer();
+                        // 超时，返回失败
+                        result = new OperateResult("连接超时（3秒）");
+                        ErrorCount++;
+                        IsConnected = false;
+                        return result;
                     }
 
                     if (result != null && result.IsSuccess)
@@ -234,6 +265,20 @@ namespace WinformDevFramework.Services.PLCBasic
                 if (_mitsubishiClient != null) return _mitsubishiClient.ReadFloat(address);
                 if (_modbusClient != null) return _modbusClient.ReadFloat(address);
                 return new OperateResult<float>("未初始化客户端");
+            });
+        }
+
+        /// <summary>
+        /// 读取单精度浮点数
+        /// </summary>
+        /// <param name="address">PLC地址</param>
+        /// <returns>读取结果，包含浮点数值</returns>
+        public OperateResult<Byte> ReadByte(string address)
+        {
+            return ExecuteWithRetry(() =>
+            {
+                if (_siemensClient != null) return _siemensClient.ReadByte(address);
+                return new OperateResult<Byte>("未初始化客户端");
             });
         }
 

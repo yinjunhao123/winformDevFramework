@@ -48,7 +48,7 @@ namespace WinformDevFramework.Repository.PLCBasic
 
             var history = new WipBarcodeHistory
             {
-                BarCodeId = wipBarCode.Id,
+                BarCodeId = wipBarCode.BarCodeId,
                 RFIDCode = wipBarCode.RFIDCode,
                 BarCode = wipBarCode.BarCode,
                 ModelCode = wipBarCode.ModelCode,

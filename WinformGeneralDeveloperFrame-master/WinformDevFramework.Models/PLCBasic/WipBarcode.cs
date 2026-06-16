@@ -6,8 +6,8 @@ namespace PLCBasic
     [SugarTable("WipBarCode")]
     public class WipBarCode
     {
-        [SugarColumn(IsPrimaryKey = true, IsIdentity = true)]
-        public long Id { get; set; }
+        [SugarColumn(IsPrimaryKey = true, IsIdentity = true, ColumnName = "BarCodeId")]
+        public long BarCodeId { get; set; }
 
         /// <summary>
         /// RFID条码

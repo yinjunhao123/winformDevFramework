@@ -225,18 +225,27 @@ namespace WinformDevFramework.Services.PLCBasic
         /// </summary>
         private void HeartbeatLoop()
         {
+            long loopCount = 0;
+            _logger.LogInformation("[心跳服务] 心跳检测线程已启动，间隔: {_intervalMs}ms");
+
             while (_isRunning)
             {
+                loopCount++;
                 try
                 {
+                    _logger.LogDebug($"[心跳服务] 第 {loopCount} 次心跳检测开始");
                     CheckAllConnections();
+                    _logger.LogDebug($"[心跳服务] 第 {loopCount} 次心跳检测完成");
                 }
-                catch (Exception)
+                catch (Exception ex)
                 {
+                    _logger.LogError(ex, $"[心跳服务] 第 {loopCount} 次心跳检测异常");
                 }
 
                 Thread.Sleep(_intervalMs);
             }
+
+            _logger.LogInformation("[心跳服务] 心跳检测线程已停止");
         }
 
         /// <summary>
@@ -247,16 +256,23 @@ namespace WinformDevFramework.Services.PLCBasic
             try
             {
                 var plcConfigs = _connectionManager.GetAllPlcConfigs().ToList();
+                _logger.LogDebug($"[心跳服务] 检测到 {plcConfigs.Count} 个PLC配置");
 
                 foreach (var config in plcConfigs)
                 {
                     CheckSingleConnection(config);
                 }
             }
-            catch
+            catch (Exception ex)
             {
+                _logger.LogError(ex, "[心跳服务] 检查所有PLC连接状态异常");
             }
         }
+
+        /// <summary>
+        /// 已发布初始状态的PLC集合（用于确保每个PLC首次检测时都发布状态）
+        /// </summary>
+        private readonly HashSet<string> _publishedInitialStatus = new HashSet<string>();
 
         /// <summary>
         /// 检查单个PLC连接状态
@@ -264,24 +280,96 @@ namespace WinformDevFramework.Services.PLCBasic
         /// <param name="config">PLC配置信息</param>
         private void CheckSingleConnection(PLC_Config config)
         {
-            // 获取之前的连接状态
-            bool wasConnected = _connectionManager.IsConnected(config.PlcCode);
-
-            // 获取当前连接状态（通过读取心跳地址DB8000.0）
-            bool isConnectedNow = CheckHeartbeat(config.PlcCode);
-
-            // 如果状态发生变化，更新状态并触发事件
-            if (wasConnected != isConnectedNow)
+            try
             {
+                // 获取之前的连接状态
+                bool wasConnected = _connectionManager.IsConnected(config.PlcCode);
+
+                // 获取当前连接状态（通过读取心跳地址DB8000.0）
+                bool isConnectedNow = CheckHeartbeat(config.PlcCode);
+
+                _logger.LogDebug($"[心跳检查] PLC {config.PlcCode} 之前={wasConnected}, 现在={isConnectedNow}");
+
+                // 如果之前连接但现在断开，尝试重连
+                if (wasConnected && !isConnectedNow)
+                {
+                    _logger?.LogWarning($"[心跳检查] PLC心跳检测失败，尝试重连: PlcCode={config.PlcCode}");
+                    
+                    // 尝试重连
+                    bool reconnectSuccess = TryReconnectPlc(config.PlcCode);
+                    
+                    if (reconnectSuccess)
+                    {
+                        // 重连成功后再次检查心跳
+                        isConnectedNow = CheckHeartbeat(config.PlcCode);
+                        _logger?.LogInformation($"[心跳检查] PLC重连后心跳检查: PlcCode={config.PlcCode}, IsOnline={isConnectedNow}");
+                    }
+                    else
+                    {
+                        _logger?.LogWarning($"[心跳检查] PLC重连失败: PlcCode={config.PlcCode}");
+                    }
+                }
+
+                // 更新连接管理器状态
                 _connectionManager.UpdateConnectionStatus(config.PlcID, isConnectedNow);
 
-                OnPlcStatusChanged(new PlcStatusChangedEventArgs
+                // 判断是否需要发布状态：
+                // 1. 首次检测（从未发布过初始状态）- 必须发布，让其他服务知道初始状态
+                // 2. 状态发生变化 - 发布变化
+                bool isFirstCheck = false;
+                lock (_publishedInitialStatus)
                 {
-                    PlcCode = config.PlcCode,
-                    PlcName = config.PlcName,
-                    IsOnline = isConnectedNow,
-                    ChangeTime = DateTime.Now
-                });
+                    if (!_publishedInitialStatus.Contains(config.PlcCode))
+                    {
+                        _publishedInitialStatus.Add(config.PlcCode);
+                        isFirstCheck = true;
+                    }
+                }
+
+                if (isFirstCheck || wasConnected != isConnectedNow)
+                {
+                    OnPlcStatusChanged(new PlcStatusChangedEventArgs
+                    {
+                        PlcCode = config.PlcCode,
+                        PlcName = config.PlcName,
+                        IsOnline = isConnectedNow,
+                        ChangeTime = DateTime.Now
+                    });
+
+                    if (isFirstCheck)
+                    {
+                        _logger?.LogInformation($"[心跳检查] 首次发布PLC状态: PlcCode={config.PlcCode}, IsOnline={isConnectedNow}");
+                    }
+                    else
+                    {
+                        _logger?.LogInformation($"[心跳检查] PLC状态变化: PlcCode={config.PlcCode}, {wasConnected} -> {isConnectedNow}");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, $"[心跳检查] 检查PLC连接状态异常: PlcCode={config.PlcCode}");
+            }
+        }
+
+        /// <summary>
+        /// 尝试重新连接PLC
+        /// </summary>
+        /// <param name="plcCode">PLC编码</param>
+        /// <returns>是否重连成功</returns>
+        private bool TryReconnectPlc(string plcCode)
+        {
+            try
+            {
+                // 调用通信服务的重连方法
+                var reconnectTask = _plcCommunicationService.ReconnectAsync(plcCode);
+                reconnectTask.Wait(10000); // 等待最多10秒
+                return reconnectTask.Result;
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, $"PLC重连异常: PlcCode={plcCode}");
+                return false;
             }
         }
 
@@ -299,18 +387,19 @@ namespace WinformDevFramework.Services.PLCBasic
                 
                 if (result.IsSuccess)
                 {
+                    _logger.LogDebug($"[心跳检查] PLC {plcCode} 读取成功，心跳值={result.Content}");
                     // 返回值为true（1）表示心跳成功
-                    return result.Content;
+                    return result.IsSuccess;
                 }
                 else
                 {
-                    _logger.LogWarning($"读取心跳地址失败: PlcCode={plcCode}, Error={result.Message}");
+                    _logger.LogDebug($"[心跳检查] PLC {plcCode} 读取失败: {result.Message}");
                     return false;
                 }
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, $"心跳检查异常: PlcCode={plcCode}");
+                _logger.LogError(ex, $"[心跳检查] PLC {plcCode} 心跳检查异常");
                 return false;
             }
         }

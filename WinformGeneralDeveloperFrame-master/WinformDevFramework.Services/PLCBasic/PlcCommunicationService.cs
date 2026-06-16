@@ -163,7 +163,17 @@ namespace WinformDevFramework.Services.PLCBasic
         }
 
         /// <summary>
-        /// 尝试重新连接PLC
+        /// 重新连接指定的PLC（公开方法，供心跳服务调用）
+        /// </summary>
+        /// <param name="plcCode">PLC编码</param>
+        /// <returns>是否重连成功</returns>
+        public async Task<bool> ReconnectAsync(string plcCode)
+        {
+            return await TryReconnectAsync(plcCode);
+        }
+
+        /// <summary>
+        /// 尝试重新连接PLC（内部实现）
         /// </summary>
         /// <param name="plcCode">PLC编码</param>
         /// <returns>是否重连成功</returns>
@@ -407,7 +417,18 @@ namespace WinformDevFramework.Services.PLCBasic
             var client = GetClient(plcCode);
             return client?.ReadFloat(address) ?? new OperateResult<float>("PLC客户端不存在");
         }
-
+        /// <summary>
+        ///读取字节数
+        /// </summary>
+        /// <param name="plcCode"></param>
+        /// <param name="address"></param>
+        /// <returns></returns>
+        /// <exception cref="NotImplementedException"></exception>
+        public OperateResult<byte> ReadByte(string plcCode, string address)
+        {
+            var client = GetClient(plcCode);
+            return client?.ReadByte(address) ?? new OperateResult<byte>("PLC客户端不存在");
+        }
         /// <summary>
         /// 读取字符串
         /// </summary>
@@ -418,7 +439,20 @@ namespace WinformDevFramework.Services.PLCBasic
         public OperateResult<string> ReadString(string plcCode, string address, ushort length)
         {
             var client = GetClient(plcCode);
-            return client?.ReadString(address, length) ?? new OperateResult<string>("PLC客户端不存在");
+            if (client == null)
+            {
+                return new OperateResult<string>("PLC客户端不存在");
+            }
+
+            var result = client.ReadString(address, length);
+            if (result.IsSuccess && !string.IsNullOrEmpty(result.Content))
+            {
+                // 清理字符串：移除前面的控制字符/空字符，移除后面的空格
+                var cleaned = result.Content.TrimEnd(' ', '\0')
+                    .TrimStart(new char[] { '\0', '\t', '\n', '\r', ' ' }); // 移除ASCII控制字符和空字符
+                result.Content = cleaned;
+            }
+            return result;
         }
 
         /// <summary>
@@ -1089,6 +1123,5 @@ namespace WinformDevFramework.Services.PLCBasic
             // 默认返回地址数字部分
             return GetAddressNumber(address) * 8;
         }
-
     }
 }

@@ -458,13 +458,33 @@ namespace WinformDevFramework.Services.PLCBasic
 
         #region 公共方法
 
+        /// <summary>
+        /// 配置加载完成信号
+        /// </summary>
+        private readonly TaskCompletionSource<bool> _configLoadedSignal = new TaskCompletionSource<bool>();
+
         public void Start()
         {
             if (_isRunning) return;
 
             _isRunning = true;
             _pollingCancellationToken = new CancellationTokenSource();
-            ReloadConfig();
+
+            // 在后台线程异步加载配置，避免阻塞主线程
+            Task.Run(() =>
+            {
+                try
+                {
+                    ReloadConfig();
+                    _logger.LogInformation("PLC_TriggerService 配置加载完成");
+                    _configLoadedSignal.TrySetResult(true);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "PLC_TriggerService 配置加载失败");
+                    _configLoadedSignal.TrySetResult(false);
+                }
+            });
 
             // 启动离线心跳线程（每5秒执行一次）
             _heartbeatThread = new Thread(async () => await HeartbeatLoop());
@@ -539,8 +559,8 @@ namespace WinformDevFramework.Services.PLCBasic
 
                         LoadDeviceStatusConfig(config.PlcCode, config.StationCode);
                         
-                        // 加载MES模式地址配置
-                        LoadMesModeConfig(config.PlcCode, config.StationCode);
+                        // 加载MES模式地址配置（全局配置，每个PLC只有一个）
+                        LoadMesModeConfig(config.PlcCode);
                     }
 
                     LoadStationRecipeCurrent();
@@ -781,63 +801,60 @@ namespace WinformDevFramework.Services.PLCBasic
 
         /// <summary>
         /// 加载MES模式地址配置（Category = 'OperationMethod'）
+        /// MES模式地址是全局的，每个PLC只有一个，与工站无关
         /// </summary>
         /// <param name="plcCode">PLC编码</param>
-        /// <param name="stationCode">工站编码</param>
-        private void LoadMesModeConfig(string plcCode, string stationCode)
+        private void LoadMesModeConfig(string plcCode)
         {
             try
             {
-                string cacheKey = $"{plcCode}_{stationCode}";
-
-                if (_mesModeAddressCache.ContainsKey(cacheKey))
+                // MES模式地址是全局的，缓存Key只使用PlcCode
+                if (_mesModeAddressCache.ContainsKey(plcCode))
                 {
                     return;
                 }
 
                 var mesModeAddress = _plcAddressRepository.Query()
-                    .FirstOrDefault(a => a.PlcCode == plcCode && a.StationCode == stationCode && a.Category == "OperationMethod");
+                    .FirstOrDefault(a => a.PlcCode == plcCode && a.Category == "OperationMethod");
 
                 if (mesModeAddress != null)
                 {
-                    _mesModeAddressCache[cacheKey] = new PLC_Address
+                    _mesModeAddressCache[plcCode] = new PLC_Address
                     {
                         PlcCode = plcCode,
-                        StationCode = stationCode,
                         AddressCode = mesModeAddress.AddressCode,
                         AddressType = mesModeAddress.AddressType,
                         DataType = mesModeAddress.DataType
                     };
-                    _mesModeCache[cacheKey] = false; // 默认MES离线
-                    _lastMesModeStatus[cacheKey] = false;
-                    _logger.LogDebug($"加载MES模式地址配置: PlcCode={plcCode}, StationCode={stationCode}, Address={mesModeAddress.AddressCode}");
+                    _mesModeCache[plcCode] = false; // 默认MES离线
+                    _lastMesModeStatus[plcCode] = false;
+                    _logger.LogDebug($"加载MES模式地址配置: PlcCode={plcCode}, Address={mesModeAddress.AddressCode}");
                 }
                 else
                 {
-                    _logger.LogWarning($"未找到MES模式地址配置: PlcCode={plcCode}, StationCode={stationCode}");
+                    _logger.LogWarning($"未找到MES模式地址配置: PlcCode={plcCode}");
                 }
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, $"加载MES模式地址配置时发生错误: PlcCode={plcCode}, StationCode={stationCode}");
+                _logger.LogError(ex, $"加载MES模式地址配置时发生错误: PlcCode={plcCode}");
             }
         }
 
         /// <summary>
         /// 读取MES模式状态
+        /// MES模式地址是全局的，每个PLC只有一个，与工站无关
         /// </summary>
         /// <param name="plcCode">PLC编码</param>
-        /// <param name="stationCode">工站编码</param>
         /// <returns>true=MES在线，false=MES离线</returns>
-        private bool ReadMesModeStatus(string plcCode, string stationCode)
+        private bool ReadMesModeStatus(string plcCode)
         {
             try
             {
-                string cacheKey = $"{plcCode}_{stationCode}";
-
-                if (!_mesModeAddressCache.TryGetValue(cacheKey, out var addressConfig))
+                // MES模式地址是全局的，缓存Key只使用PlcCode
+                if (!_mesModeAddressCache.TryGetValue(plcCode, out var addressConfig))
                 {
-                    _logger.LogWarning($"未找到MES模式地址配置: {cacheKey}");
+                    _logger.LogWarning($"未找到MES模式地址配置: PlcCode={plcCode}");
                     return false; // 默认MES离线
                 }
 
@@ -846,7 +863,7 @@ namespace WinformDevFramework.Services.PLCBasic
                 
                 if (value == null)
                 {
-                    _logger.LogWarning($"读取MES模式地址失败: {cacheKey}, Address={addressConfig.AddressCode}");
+                    _logger.LogWarning($"读取MES模式地址失败: PlcCode={plcCode}, Address={addressConfig.AddressCode}");
                     return false;
                 }
 
@@ -854,19 +871,19 @@ namespace WinformDevFramework.Services.PLCBasic
                 bool isMesOnline = Convert.ToBoolean(value);
                 
                 // 检查模式是否发生变化
-                if (_lastMesModeStatus.TryGetValue(cacheKey, out var lastStatus) && lastStatus != isMesOnline)
+                if (_lastMesModeStatus.TryGetValue(plcCode, out var lastStatus) && lastStatus != isMesOnline)
                 {
-                    _logger.LogInformation($"MES模式切换: {cacheKey} -> {(isMesOnline ? "MES在线" : "MES离线")}");
+                    _logger.LogInformation($"MES模式切换: PlcCode={plcCode} -> {(isMesOnline ? "MES在线" : "MES离线")}");
                 }
                 
-                _lastMesModeStatus[cacheKey] = isMesOnline;
-                _mesModeCache[cacheKey] = isMesOnline;
+                _lastMesModeStatus[plcCode] = isMesOnline;
+                _mesModeCache[plcCode] = isMesOnline;
                 
                 return isMesOnline;
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, $"读取MES模式状态失败: PlcCode={plcCode}, StationCode={stationCode}");
+                _logger.LogError(ex, $"读取MES模式状态失败: PlcCode={plcCode}");
                 return false; // 异常时默认MES离线
             }
         }
@@ -877,7 +894,26 @@ namespace WinformDevFramework.Services.PLCBasic
         /// </summary>
         private async Task HeartbeatLoop()
         {
-            _logger.LogInformation("离线心跳线程已启动，间隔: {HeartbeatIntervalMs}ms", HeartbeatIntervalMs);
+            _logger.LogInformation("离线心跳线程已启动，间隔: {HeartbeatIntervalMs}ms，等待配置加载...");
+
+            // 等待配置加载完成（最多等待30秒）
+            try
+            {
+                using var cts = new CancellationTokenSource(30000);
+                bool configLoaded = await _configLoadedSignal.Task.WaitAsync(cts.Token);
+                if (!configLoaded)
+                {
+                    _logger.LogWarning("配置加载失败，离线心跳将以空配置运行");
+                }
+                else
+                {
+                    _logger.LogInformation("配置加载完成，开始离线心跳");
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                _logger.LogWarning("配置加载超时（30秒），离线心跳将以当前配置运行");
+            }
 
             while (_isRunning)
             {
@@ -989,7 +1025,7 @@ namespace WinformDevFramework.Services.PLCBasic
         {
             try
             {
-                string dataType = addressConfig.DataType?.ToUpper();
+                string dataType = addressConfig.DataType?.ToLower();
                 
                 switch (dataType)
                 {
@@ -1062,9 +1098,28 @@ namespace WinformDevFramework.Services.PLCBasic
             long totalPollCount = 0;
             long totalProcessingTime = 0;
 
-            _logger.LogInformation($"PLC轮询线程已启动，初始间隔: {_pollingIntervalMs}ms");
+            _logger.LogInformation($"PLC轮询线程已启动，初始间隔: {_pollingIntervalMs}ms，等待配置加载...");
             PerformanceLogger.Log("TriggerService.PollingLoop", "Status", "Started");
             PerformanceLogger.Log("TriggerService.PollingLoop", "PollingIntervalMs", _pollingIntervalMs);
+
+            // 等待配置加载完成（最多等待30秒）
+            try
+            {
+                using var cts = new CancellationTokenSource(30000);
+                bool configLoaded = await _configLoadedSignal.Task.WaitAsync(cts.Token);
+                if (!configLoaded)
+                {
+                    _logger.LogWarning("配置加载失败，轮询线程将以空配置运行");
+                }
+                else
+                {
+                    _logger.LogInformation("配置加载完成，开始轮询");
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                _logger.LogWarning("配置加载超时（30秒），轮询线程将以当前配置运行");
+            }
 
             while (_isRunning)
             {
@@ -1073,6 +1128,8 @@ namespace WinformDevFramework.Services.PLCBasic
 
                 try
                 {
+                    _logger.LogDebug($"[轮询] 第 {totalPollCount} 次轮询开始，当前间隔: {_pollingIntervalMs}ms");
+
                     // 检查MES模式并执行相应逻辑（使用await替代.Wait）
                     using (var cts = CancellationTokenSource.CreateLinkedTokenSource(_pollingCancellationToken.Token))
                     {
@@ -1093,16 +1150,37 @@ namespace WinformDevFramework.Services.PLCBasic
 
                     // 动态调整轮询间隔
                     AdjustPollingInterval(elapsedMs);
+
+                    // 每100次轮询输出一次汇总信息
+                    if (totalPollCount % 100 == 0)
+                    {
+                        _logger.LogInformation($"[轮询] 第 {totalPollCount} 次轮询完成，耗时: {elapsedMs}ms，平均耗时: {totalProcessingTime / totalPollCount}ms");
+                    }
+                    else
+                    {
+                        _logger.LogDebug($"[轮询] 第 {totalPollCount} 次轮询完成，耗时: {elapsedMs}ms");
+                    }
                 }
-                catch (OperationCanceledException)
+                catch (TaskCanceledException)
                 {
+                    // 超时或取消，继续下一轮
+                    pollStopwatch.Stop();
                     if (_pollingCancellationToken?.Token.IsCancellationRequested == true)
                     {
                         _logger.LogInformation("轮询任务被取消");
                         break;
                     }
-                    // 超时取消，继续下一轮
+                    _logger.LogDebug($"轮询超时，继续下一轮");
+                }
+                catch (OperationCanceledException)
+                {
+                    // 超时或取消，继续下一轮
                     pollStopwatch.Stop();
+                    if (_pollingCancellationToken?.Token.IsCancellationRequested == true)
+                    {
+                        _logger.LogInformation("轮询任务被取消");
+                        break;
+                    }
                     _logger.LogDebug($"轮询超时，继续下一轮");
                 }
                 catch (Exception ex)
@@ -1227,60 +1305,58 @@ namespace WinformDevFramework.Services.PLCBasic
                     mesModeKeys = _mesModeAddressCache.Keys.ToList();
                 }
 
+                _logger.LogDebug($"[MES模式检查] 开始，MES模式配置数量: {mesModeKeys.Count}");
+
                 if (!mesModeKeys.Any())
                 {
                     // 如果没有MES模式配置，默认走MES离线模式（定时任务轮询）
-                    _logger.LogDebug("未配置MES模式地址，默认执行MES离线模式（定时任务轮询）");
+                    _logger.LogDebug("[MES模式检查] 未配置MES模式地址，默认执行MES离线模式（定时任务轮询）");
                     await CheckAllTriggersAsync(false);
                     return;
                 }
 
-                // 检查是否有任何工站处于MES离线模式
+                // 检查是否有任何PLC处于MES离线模式
                 bool hasOfflineStation = false;
+                int offlineCount = 0;
+                int onlineCount = 0;
                 
-                foreach (var key in mesModeKeys)
+                foreach (var plcCode in mesModeKeys)
                 {
-                    var parts = key.Split('_');
-                    if (parts.Length != 2)
-                    {
-                        _logger.LogWarning($"MES模式缓存Key格式错误: {key}");
-                        continue;
-                    }
-
-                    string plcCode = parts[0];
-                    string stationCode = parts[1];
-
-                    // 读取当前MES模式状态
-                    bool isMesOnline = ReadMesModeStatus(plcCode, stationCode);
+                    // 读取当前MES模式状态（全局配置，与工站无关）
+                    bool isMesOnline = ReadMesModeStatus(plcCode);
 
                     if (!isMesOnline)
                     {
-                        // 发现MES离线工站，需要执行定时轮询
+                        // 发现MES离线PLC，需要执行定时轮询
                         hasOfflineStation = true;
-                        _logger.LogDebug($"工站 {key} 处于MES离线模式");
+                        offlineCount++;
+                        _logger.LogDebug($"[MES模式检查] PLC {plcCode} 处于MES离线模式");
                     }
                     else
                     {
-                        _logger.LogDebug($"工站 {key} 处于MES在线模式（等待事件触发）");
+                        onlineCount++;
+                        _logger.LogDebug($"[MES模式检查] PLC {plcCode} 处于MES在线模式");
                     }
                 }
+
+                _logger.LogDebug($"[MES模式检查] 完成，在线: {onlineCount}, 离线: {offlineCount}, 执行轮询: {hasOfflineStation}");
 
                 // 只要有任何工站处于MES离线模式，就执行定时轮询
                 if (hasOfflineStation)
                 {
-                    _logger.LogDebug("存在MES离线工站，执行定时任务轮询");
+                    _logger.LogDebug("[MES模式检查] 存在MES离线PLC，执行定时任务轮询");
                     await CheckAllTriggersAsync(false);
                 }
                 else
                 {
                     // 所有工站都是MES在线模式，不需要主动轮询，等待事件触发
+                    _logger.LogDebug("[MES模式检查] 所有PLC均为MES在线模式，跳过轮询，等待事件触发");
                     await CheckAllTriggersAsync(true);  
-                    _logger.LogDebug("所有工站均为MES在线模式，跳过轮询，等待事件触发");
                 }
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "检查MES模式并执行相应逻辑时发生错误");
+                _logger.LogError(ex, "[MES模式检查] 发生错误");
             }
         }
 
@@ -1294,7 +1370,10 @@ namespace WinformDevFramework.Services.PLCBasic
             }
 
             if (!configsToCheck.Any())
+            {
+                _logger.LogDebug("[触发检查] 无触发点配置，跳过");
                 return;
+            }
 
             // 记录性能指标：触发点总数
             PerformanceLogger.Log("TriggerService.CheckAllTriggers", "TriggerPointCount", configsToCheck.Count);
@@ -1304,6 +1383,8 @@ namespace WinformDevFramework.Services.PLCBasic
 
             // 记录PLC分组数量
             PerformanceLogger.Log("TriggerService.CheckAllTriggers", "PlcGroupCount", plcGroups.Count);
+
+            _logger.LogDebug($"[触发检查] 开始，模式={(flag ? "MES在线" : "MES离线")}，PLC分组数: {plcGroups.Count}，触发点总数: {configsToCheck.Count}");
 
             var stopwatch = global::System.Diagnostics.Stopwatch.StartNew();
 
@@ -1325,7 +1406,7 @@ namespace WinformDevFramework.Services.PLCBasic
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, $"并行处理PLC触发点时发生错误");
+                _logger.LogError(ex, $"[触发检查] 并行处理PLC触发点时发生错误");
             }
 
             stopwatch.Stop();
@@ -1333,10 +1414,12 @@ namespace WinformDevFramework.Services.PLCBasic
             // 记录性能日志
             PerformanceLogger.Log("TriggerService.CheckAllTriggers", "TotalProcessingTimeMs", stopwatch.ElapsedMilliseconds);
 
+            _logger.LogDebug($"[触发检查] 完成，耗时: {stopwatch.ElapsedMilliseconds}ms");
+
             // 如果处理时间超过轮询间隔的50%，记录警告
             if (stopwatch.ElapsedMilliseconds > _pollingIntervalMs * 0.5)
             {
-                _logger.LogWarning($"PLC触发检查耗时 {stopwatch.ElapsedMilliseconds}ms，超过轮询间隔 {_pollingIntervalMs}ms 的50%，建议优化");
+                _logger.LogWarning($"[触发检查] 耗时 {stopwatch.ElapsedMilliseconds}ms，超过轮询间隔 {_pollingIntervalMs}ms 的50%，建议优化");
             }
         }
 
@@ -1351,12 +1434,14 @@ namespace WinformDevFramework.Services.PLCBasic
 
             try
             {
+                _logger.LogDebug($"[PLC处理] 开始处理 PLC={plcCode}, 触发点数={configs.Count}, 模式={(flag ? "MES在线" : "MES离线")}");
+
                 // 检查连接状态（复用心跳服务状态）
                 if (!CheckPlcConnectionStatus(plcCode))
                 {
                     // 心跳服务说离线，不要自己重连，等待心跳服务的状态更新
                     // 心跳服务会负责PLC的连接和重连
-                    _logger.LogDebug($"PLC {plcCode} 未连接，等待心跳服务处理");
+                    _logger.LogDebug($"[PLC处理] PLC {plcCode} 未连接，等待心跳服务处理");
                     stopwatch.Stop();
                     PerformanceLogger.Log($"TriggerService.ProcessPlcGroup.{plcCode}", "Status", "Offline");
                     PerformanceLogger.Log($"TriggerService.ProcessPlcGroup.{plcCode}", "ProcessingTimeMs", stopwatch.ElapsedMilliseconds);
@@ -1383,11 +1468,14 @@ namespace WinformDevFramework.Services.PLCBasic
                     try
                     {
                         var batchStopwatch = global::System.Diagnostics.Stopwatch.StartNew();
+                        _logger.LogDebug($"[PLC处理] PLC {plcCode} 开始批量读取 {addresses.Count} 个地址");
                         bool[] results = await _plcCommunicationService.ReadBatchAsync(plcCode, addresses);
                         batchStopwatch.Stop();
 
                         PerformanceLogger.Log($"TriggerService.ProcessPlcGroup.{plcCode}", "BatchReadTimeMs", batchStopwatch.ElapsedMilliseconds);
                         PerformanceLogger.Log($"TriggerService.ProcessPlcGroup.{plcCode}", "BatchReadCount", boolConfigs.Count);
+
+                        _logger.LogDebug($"[PLC处理] PLC {plcCode} 批量读取完成，耗时={batchStopwatch.ElapsedMilliseconds}ms");
 
                         for (int i = 0; i < boolConfigs.Count && i < results.Length; i++)
                         {
@@ -1398,7 +1486,7 @@ namespace WinformDevFramework.Services.PLCBasic
                     catch (Exception ex)
                     {
                         errorCount++;
-                        _logger.LogError(ex, $"PLC {plcCode} 批量读取失败，回退到逐个读取");
+                        _logger.LogError(ex, $"[PLC处理] PLC {plcCode} 批量读取失败，回退到逐个读取");
                         PerformanceLogger.Log($"TriggerService.ProcessPlcGroup.{plcCode}", "BatchReadError", 1);
 
                         // 回退到逐个读取
@@ -1413,7 +1501,7 @@ namespace WinformDevFramework.Services.PLCBasic
                             catch (Exception readEx)
                             {
                                 errorCount++;
-                                _logger.LogError(readEx, $"PLC {plcCode} 读取地址 {config.TriggerAddress} 失败");
+                                _logger.LogError(readEx, $"[PLC处理] PLC {plcCode} 读取地址 {config.TriggerAddress} 失败");
                             }
                         }
                     }
@@ -1431,7 +1519,7 @@ namespace WinformDevFramework.Services.PLCBasic
                     catch (Exception ex)
                     {
                         errorCount++;
-                        _logger.LogError(ex, $"PLC {plcCode} 读取地址 {config.TriggerAddress} 失败");
+                        _logger.LogError(ex, $"[PLC处理] PLC {plcCode} 读取地址 {config.TriggerAddress} 失败");
                     }
                 }
 
@@ -1446,13 +1534,17 @@ namespace WinformDevFramework.Services.PLCBasic
                 // 如果处理时间超过50ms，记录详细信息
                 if (stopwatch.ElapsedMilliseconds > 50)
                 {
-                    _logger.LogInformation($"PLC {plcCode} 处理完成: 触发点={triggerCount}, 错误={errorCount}, 耗时={stopwatch.ElapsedMilliseconds}ms");
+                    _logger.LogInformation($"[PLC处理] PLC {plcCode} 处理完成: 触发点={triggerCount}, 错误={errorCount}, 耗时={stopwatch.ElapsedMilliseconds}ms");
+                }
+                else
+                {
+                    _logger.LogDebug($"[PLC处理] PLC {plcCode} 处理完成: 触发点={triggerCount}, 错误={errorCount}, 耗时={stopwatch.ElapsedMilliseconds}ms");
                 }
             }
             catch (Exception ex)
             {
                 errorCount++;
-                _logger.LogError(ex, $"处理PLC {plcCode} 触发点失败");
+                _logger.LogError(ex, $"[PLC处理] 处理PLC {plcCode} 触发点失败");
 
                 stopwatch.Stop();
                 PerformanceLogger.Log($"TriggerService.ProcessPlcGroup.{plcCode}", "ProcessingTimeMs", stopwatch.ElapsedMilliseconds);
@@ -1949,6 +2041,24 @@ namespace WinformDevFramework.Services.PLCBasic
                 string batchCheckId = readDataPointsDict.ContainsKey("BatchCheckID") ? readDataPointsDict["BatchCheckID"] : string.Empty;
                 //程序号
                 string RecipeVer= readDataPointsDict.ContainsKey("RecipeVer") ? readDataPointsDict["RecipeVer"] : string.Empty;
+                
+                // 清理从PLC读取的字符串中的控制字符（如 \u0012、\t 等），只保留可见字符
+                if (!string.IsNullOrEmpty(partType))
+                {
+                    partType = new string(partType.Where(c => c >= 32).ToArray()).Trim();
+                }
+                if (!string.IsNullOrEmpty(partId))
+                {
+                    partId = new string(partId.Where(c => c >= 32).ToArray()).Trim();
+                }
+                if (!string.IsNullOrEmpty(batchCheckId))
+                {
+                    batchCheckId = new string(batchCheckId.Where(c => c >= 32).ToArray()).Trim();
+                }
+                if (!string.IsNullOrEmpty(RecipeVer))
+                {
+                    RecipeVer = new string(RecipeVer.Where(c => c >= 32).ToArray()).Trim();
+                }
                 //返修标志
                 bool atRepair= readDataPointsDict.ContainsKey("AtRepair") ? bool.Parse(readDataPointsDict["AtRepair"]) : false;
                 WipBarCode wipBarcode=new WipBarCode();
@@ -1981,7 +2091,7 @@ namespace WinformDevFramework.Services.PLCBasic
                         return;
                     }
                     //创建新RFID条码
-                    partId = await GenerateBarcode(stationCode);
+                    partId = await GenerateBarcode(stationCode,RecipeVer);
                     partType = wipBarcode.ModelCode;
                     RecipeVer = wipBarcode.RecipeCode;
                 }
@@ -1991,12 +2101,12 @@ namespace WinformDevFramework.Services.PLCBasic
                 PLC_StationRecipeCurrent stationRecipeCurrent = new PLC_StationRecipeCurrent();
                 if (!atRepair)
                 {
-                    if (stationCode == "OP05")
+                    if (stationCode == "OP05-1A")
                     {
                         var parameterDistribution = await _parameterDistributionRepository.QueryByClauseAsync(pd => pd.RecipeCode == RecipeVer);
                         if (parameterDistribution == null)
                         {
-                            msg = $"OP05-1工站程序号{RecipeVer}未获取到对应参数分配信息";
+                            msg = $"OP05-1A工站程序号{RecipeVer}未获取到对应参数分配信息";
                             _logger.LogInformation($"发布主零件进站校验失败: StationCode={stationCode}, Barcode={partId},失败原因{msg}");
                             await ErrorMsg(plcCode, stationCode, partId, msg, 4, writeDataPoints, dataToWrite);
                             DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
@@ -2004,12 +2114,12 @@ namespace WinformDevFramework.Services.PLCBasic
                         }
                         partType = parameterDistribution.ProductModelCode;
                         //重新生成RFID条码
-                        partId = await GenerateBarcode(stationCode);
+                        partId = await GenerateBarcode(stationCode, RecipeVer);
 
                     }
                     else
                     {
-                        //OP05工站单独处理  型号、条码信息都为空
+                        //OP05-1A工站单独处理  型号、条码信息都为空
                         if (string.IsNullOrWhiteSpace(RecipeVer))
                         {
                             msg = $"{stationCode}工站未传递程序版本号";
@@ -2050,7 +2160,7 @@ namespace WinformDevFramework.Services.PLCBasic
                     }
                     //不可逆信息
                     var process = await _wipBarCodeProcessRepository.QueryByClauseAsync(o => o.RfidCode == partId && o.StationCode == stationCode);
-                    if (process == null)
+                    if (process != null)
                     {
                         msg = $"该条码{partId}在工站{stationCode}有不可逆信息";
                         await ErrorMsg(plcCode, stationCode, partId, msg, 6, writeDataPoints, dataToWrite);
@@ -2077,7 +2187,7 @@ namespace WinformDevFramework.Services.PLCBasic
                 {
                     //进行参数下发
                     // 参数版本不一致，需要下发新参数
-                   string mbRecipeVer= stationCode == "OP05" ? RecipeVer : wipBarcode.RecipeCode;
+                   string mbRecipeVer= stationCode == "OP05-1A" ? RecipeVer : wipBarcode.RecipeCode;
                     _logger.LogInformation($"参数版本不一致，开始下发新参数: 当前RecipeVer={RecipeVer}, 目标Recipe={mbRecipeVer}");
                     // 3.1 拿RecipeVer值匹配PLC_ParameterDistribution的RecipeCode
                     var parameterDistribution = await _parameterDistributionRepository.QueryByClauseAsync(pd => pd.RecipeCode == mbRecipeVer);
@@ -2127,6 +2237,11 @@ namespace WinformDevFramework.Services.PLCBasic
                         CreateTime = DateTime.Now
                     };
                     await _parameterDistributionHistoryRepository.InsertAsync(history);
+                    
+                    // 查询获取实际生成的HistoryID
+                    var insertedHistory = await _parameterDistributionHistoryRepository.QueryByClauseAsync(
+                        h => h.ProductModelCode == partType && h.RecipeCode == RecipeVer && h.SnapshotTime == history.SnapshotTime);
+                    long actualHistoryID = insertedHistory?.ID ?? 0;
 
                     // 3.5 创建历史明细记录
                     List<PLC_ParameterDistributionDetailHistory> historyDetails = new List<PLC_ParameterDistributionDetailHistory>();
@@ -2134,7 +2249,7 @@ namespace WinformDevFramework.Services.PLCBasic
                     {
                         var historyDetail = new PLC_ParameterDistributionDetailHistory
                         {
-                            HistoryID = history.ID,
+                            HistoryID = actualHistoryID,
                             PlcCode = detail.PlcCode,
                             EquipmentCode = detail.EquipmentCode,
                             StationCode = detail.StationCode,
@@ -2148,14 +2263,14 @@ namespace WinformDevFramework.Services.PLCBasic
                         historyDetails.Add(historyDetail);
                     }
                     await _parameterDistributionDetailHistoryRepository.InsertAsync(historyDetails);
-                    _logger.LogInformation($"创建历史记录成功: HistoryID={history.ID}, DetailCount={historyDetails.Count}");
+                    _logger.LogInformation($"创建历史记录成功: HistoryID={actualHistoryID}, DetailCount={historyDetails.Count}");
 
                     // 3.6 设置PartType和RecipeVer
-                    dataToWrite.Add("PartType", parameterDistribution.ProductModelCode);
-                    dataToWrite.Add("RecipeVer", mbRecipeVer);
+                    //dataToWrite.Add("PartType", parameterDistribution.ProductModelCode);
+                    //dataToWrite.Add("RecipeVer", mbRecipeVer);
                     // 3.7 设置PartOK=1，RecipeDone=1
-                    dataToWrite.Add("PartOK", true);
-                    dataToWrite.Add("RecipeDone", true);
+                    //dataToWrite.Add("PartOK", true);
+                    //dataToWrite.Add("RecipeDone", true);
 
                     _logger.LogInformation("参数下发数据准备完成");
 
@@ -2231,8 +2346,8 @@ namespace WinformDevFramework.Services.PLCBasic
                     {
                         DistributionID = parameterDistribution.ID,
                         RecordCode = recordCode,
-                        ProductModelCode = stationRecipeCurrent.ProductModelCode,
-                        RecipeCode = stationRecipeCurrent.RecipeCode,
+                        ProductModelCode = parameterDistribution.ProductModelCode,
+                        RecipeCode = parameterDistribution.RecipeCode,
                         DistributionType = "Dispatching",
                         PlcCode = plcCode,
                         EquipmentCode = distributionDetails.FirstOrDefault()?.EquipmentCode ?? string.Empty,
@@ -2251,18 +2366,23 @@ namespace WinformDevFramework.Services.PLCBasic
                     };
                     await _parameterDistributionRecordRepository.InsertAsync(record);
 
-                    // 3.11 更新下发记录明细的RecordID
+                    // 查询获取实际生成的RecordID
+                    var insertedRecord = await _parameterDistributionRecordRepository.QueryByClauseAsync(
+                        r => r.RecordCode == recordCode);
+                    long actualRecordID = insertedRecord?.ID ?? 0;
+
+                    // 3.11 设置下发记录明细的RecordID并插入数据库
                     foreach (var recordDetail in recordDetails)
                     {
-                        recordDetail.RecordID = record.ID;
+                        recordDetail.RecordID = actualRecordID;
+                        await _parameterDistributionRecordDetailRepository.InsertAsync(recordDetail);
                     }
-                    await _parameterDistributionRecordDetailRepository.InsertAsync(recordDetails);
 
-                    _logger.LogInformation($"创建下发记录成功: RecordID={record.ID}, Status={status}, Success={successCount}, Failed={failedCount}");
+                    _logger.LogInformation($"创建下发记录成功: RecordID={actualRecordID}, Status={status}, Success={successCount}, Failed={failedCount}");
 
                     // 3.12 更新PLC_StationRecipeCurrent表
-                    await UpdateStationRecipeCurrent(plcCode, stationCode, stationRecipeCurrent.RecipeCode,
-                        stationRecipeCurrent.ProductModelCode, stationRecipeCurrent.RoutingCode, "System");
+                    await UpdateStationRecipeCurrent(plcCode, stationCode, parameterDistribution.RecipeCode,
+                        parameterDistribution.ProductModelCode, parameterDistribution.RoutingCode, "System");
                     msg="参数下发完成";
                     // 发布PLC参数下发事件（下发完成）
                     DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
@@ -2291,7 +2411,7 @@ namespace WinformDevFramework.Services.PLCBasic
                 // PLC 操作完成后，异步更新或新增 WipBarCode 表数据
                 if (!atRepair)
                 {
-                    await UpdateWipBarcodeAsync(partId, partType, stationCode, batchCheckId, stationProcessInfo);
+                    await UpdateWipBarcodeAsync(partId, partType, stationCode, batchCheckId, stationProcessInfo,RecipeVer);
                 }
                 else
                 {
@@ -2358,7 +2478,7 @@ namespace WinformDevFramework.Services.PLCBasic
             dataToWrite.Add("PartIDReqDone", true);
             // 主条码进站失败错误代码：3，错误信息：msg
             dataToWrite.Add("MainCheckInErrorCode", MainCheckInErrorCode);
-            dataToWrite.Add("MainCheckInErrorMsg", msg);
+            //dataToWrite.Add("MainCheckInErrorMsg", msg);
             _logger.LogInformation($"发布主零件进站校验失败: StationCode={stationCode}, Barcode={partId},失败原因{msg}");
             bool isSuccess = await CollectAndWriteDataPointsAsync(plcCode, writeDataPoints, dataToWrite);
             if (!isSuccess)
@@ -3864,6 +3984,11 @@ namespace WinformDevFramework.Services.PLCBasic
                             CreateTime = DateTime.Now
                         };
                         await _parameterDistributionHistoryRepository.InsertAsync(history);
+                        
+                        // 查询获取实际生成的HistoryID
+                        var insertedHistory = await _parameterDistributionHistoryRepository.QueryByClauseAsync(
+                            h => h.ProductModelCode == partType && h.RecipeCode == recipeVer && h.SnapshotTime == history.SnapshotTime);
+                        long actualHistoryID = insertedHistory?.ID ?? 0;
 
                         // 创建历史明细记录
                         List<PLC_ParameterDistributionDetailHistory> historyDetails = new List<PLC_ParameterDistributionDetailHistory>();
@@ -3876,7 +4001,7 @@ namespace WinformDevFramework.Services.PLCBasic
 
                             var historyDetail = new PLC_ParameterDistributionDetailHistory
                             {
-                                HistoryID = history.ID,
+                                HistoryID = actualHistoryID,
                                 PlcCode = changedDetail.PlcCode,
                                 EquipmentCode = changedDetail.EquipmentCode,
                                 StationCode = changedDetail.StationCode,
@@ -3890,7 +4015,7 @@ namespace WinformDevFramework.Services.PLCBasic
                             historyDetails.Add(historyDetail);
                         }
                         await _parameterDistributionDetailHistoryRepository.InsertAsync(historyDetails);
-                        _logger.LogInformation($"创建历史记录成功: HistoryID={history.ID}, DetailCount={historyDetails.Count}");
+                        _logger.LogInformation($"创建历史记录成功: HistoryID={actualHistoryID}, DetailCount={historyDetails.Count}");
 
                         // 更新参数下发明细表
                         await _parameterDistributionDetailRepository.UpdateAsync(distributionDetails);
@@ -4098,7 +4223,10 @@ namespace WinformDevFramework.Services.PLCBasic
             }
             else if (expected is string stringValue)
             {
-                return string.Equals((string)actual, stringValue, StringComparison.Ordinal);
+                // 清理读取值中的控制字符和空格后再比较
+                string cleanedActual = CleanPlcString(actual as string);
+                string cleanedExpected = CleanPlcString(stringValue);
+                return string.Equals(cleanedActual, cleanedExpected, StringComparison.Ordinal);
             }
             else
             {
@@ -4107,12 +4235,21 @@ namespace WinformDevFramework.Services.PLCBasic
         }
 
         /// <summary>
+        /// 清理PLC字符串中的控制字符和空格
+        /// </summary>
+        private string CleanPlcString(string value)
+        {
+            if (string.IsNullOrEmpty(value)) return value ?? string.Empty;
+            return new string(value.Where(c => c >= 32).ToArray()).Trim();
+        }
+
+        /// <summary>
         /// 异步更新或新增 WipBarcode 表数据
         /// </summary>
         /// <param name="barCode">条码</param>
         /// <param name="modelCode">型号</param>
         /// <param name="stationCode">当前工站</param>
-        private async Task UpdateWipBarcodeAsync(string barCode, string modelCode, string stationCode, string batchCode, StationProcessInfo stationProcessInfo)
+        private async Task UpdateWipBarcodeAsync(string barCode, string modelCode, string stationCode, string batchCode, StationProcessInfo stationProcessInfo,string RecipeCode)
         {
             try
             {
@@ -4131,18 +4268,18 @@ namespace WinformDevFramework.Services.PLCBasic
                     var newBarcode = new WipBarCode
                     {
                         RFIDCode = barCode,
-                        ModelCode = modelCode,
+                        ModelCode = modelCode, 
                         BarCodeType = "2",
                         Status = 0,
                         RepairCount = 0,
-                        PrStationCode = "OP05",
-                        StationCode = "OP05",
-                        NextStationCode = "OP10",
+                        PrStationCode = "OP05-1A",
+                        StationCode = "OP05-1A",
+                        NextStationCode = "OP05-1B",
                         InputTime = now,
                         CreateUser = "system",
                         CreateTime = now,
                         BatchCode = batchCode,
-                        RecipeCode = stationProcessInfo?.Recipe
+                        RecipeCode = RecipeCode
                     };
 
                     await _wipBarcodeRepository.InsertAsync(newBarcode);
@@ -4453,6 +4590,9 @@ namespace WinformDevFramework.Services.PLCBasic
                     case "int32":
                         var intResult = _plcCommunicationService.ReadInt32(plcCode, config.AddressCode);
                         return intResult.IsSuccess ? intResult.Content : -1;
+                    case "byte":
+                        var byteResult = _plcCommunicationService.ReadByte(plcCode, config.AddressCode);
+                        return byteResult.IsSuccess ? byteResult.Content : -1;
                     default:
                         var defaultResult = _plcCommunicationService.ReadInt32(plcCode, config.AddressCode);
                         return defaultResult.IsSuccess ? defaultResult.Content : -1;
@@ -4638,20 +4778,26 @@ namespace WinformDevFramework.Services.PLCBasic
             return readDataPointsDict;
         }
 
-        private async Task<string> GenerateBarcode(string stationCode)
+        private async Task<string> GenerateBarcode(string stationCode,string RecipeCode)
         {
             try
             {
+                string routingCode =string.Empty;
                 // 从工站当前生产状态获取工艺路线
                 var stationRecipe = await _stationRecipeCurrentRepository.QueryByClauseAsync(sr => sr.StationCode == stationCode);
 
                 if (stationRecipe == null || string.IsNullOrEmpty(stationRecipe.RoutingCode))
                 {
                     _logger.LogError("未找到工站当前生产状态或工艺路线编码");
-                    return string.Empty;
+                    var parameterDistribution = await _parameterDistributionRepository.QueryByClauseAsync(pd => pd.RecipeCode == RecipeCode);
+                    routingCode = parameterDistribution.RoutingCode;
+                    if (string.IsNullOrEmpty(routingCode)){
+                        _logger.LogError($"未找到默认工艺路线编码: RecipeCode={RecipeCode}");   
+                        return string.Empty;
+                    }
+                }else{
+                    routingCode=stationRecipe.RoutingCode;
                 }
-
-                string routingCode = stationRecipe.RoutingCode;
 
                 // 从数据库获取工艺路线详情
                 var routingList = await _routingRepository.QueryListByClauseAsync(r => r.RoutingCode == routingCode);
@@ -4704,7 +4850,7 @@ namespace WinformDevFramework.Services.PLCBasic
                 string barcode = string.Empty;
                 foreach (var ruleItem in ruleDetails)
                 {
-                    string segment = GenerateBarcodeSegment(ruleItem);
+                    string segment = await GenerateBarcodeSegmentAsync(ruleItem);
                     barcode += segment;
                 }
 
@@ -4717,7 +4863,7 @@ namespace WinformDevFramework.Services.PLCBasic
             }
         }
 
-        private string GenerateBarcodeSegment(MD_BarCodeRuleList ruleItem)
+        private async Task<string> GenerateBarcodeSegmentAsync(MD_BarCodeRuleList ruleItem)
         {
             try
             {
@@ -4741,9 +4887,9 @@ namespace WinformDevFramework.Services.PLCBasic
                         return DateTime.Now.ToString(dateFormat);
 
                     case "SEQUENCE":
-                        // 流水号，根据 FixedLength 指定位数生成
+                        // 流水号，查询当日WipBarCode表中RFIDCode最大流水号+1
                         int length = ruleItem.FixedLength ?? 6;
-                        return GenerateSerialNumber(ruleItem.BarCodeRuleId, length);
+                        return await GenerateSerialNumberAsync(length);
 
                     default:
                         _logger.LogWarning($"未知的 SegmentType: {segmentType}");
@@ -4757,17 +4903,47 @@ namespace WinformDevFramework.Services.PLCBasic
             }
         }
 
-        private string GenerateSerialNumber(long barCodeRuleId, int length)
+        private async Task<string> GenerateSerialNumberAsync(int length)
         {
             try
             {
-                string timestamp = DateTime.Now.ToString("HHmmss");
-                return timestamp.Substring(0, Math.Min(length, timestamp.Length)).PadLeft(length, '0');
+                // 查询当日所有RFIDCode
+                DateTime today = DateTime.Today;
+                DateTime tomorrow = today.AddDays(1);
+                var todayBarcodes = await _wipBarcodeRepository.QueryListByClauseAsync(
+                    o => o.CreateTime >= today && o.CreateTime < tomorrow && !string.IsNullOrEmpty(o.RFIDCode));
+
+                if (todayBarcodes == null || todayBarcodes.Count == 0)
+                {
+                    // 当日无数据，从1开始
+                    return "1".PadLeft(length, '0');
+                }
+
+                // 提取所有RFIDCode中的流水号部分（最后length位数字），找出最大值
+                long maxSequence = 0;
+                foreach (var barcode in todayBarcodes)
+                {
+                    // 从RFIDCode中提取所有数字字符
+                    var digits = new string(barcode.RFIDCode.Where(char.IsDigit).ToArray());
+                    if (string.IsNullOrEmpty(digits) || digits.Length < length)
+                        continue;
+
+                    // 取最后length位作为流水号
+                    string sequenceStr = digits.Substring(digits.Length - length);
+                    if (long.TryParse(sequenceStr, out long seq) && seq > maxSequence)
+                    {
+                        maxSequence = seq;
+                    }
+                }
+
+                // 最大值+1
+                long nextSequence = maxSequence + 1;
+                return nextSequence.ToString().PadLeft(length, '0');
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, $"生成流水号时发生错误: BarCodeRuleId={barCodeRuleId}, Length={length}");
-                return string.Empty.PadLeft(length, '0');
+                _logger.LogError(ex, $"生成流水号时发生错误: Length={length}");
+                return "1".PadLeft(length, '0');
             }
         }
         #endregion

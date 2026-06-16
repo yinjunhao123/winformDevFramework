@@ -548,13 +548,12 @@ namespace WinformDevFramework.Services.PLCBasic
             await _semaphore.WaitAsync(_cts.Token);
             try
             {
-                if (!_connectionManager.IsConnected(config.PlcCode))
+                // 使用心跳服务的状态缓存判断PLC是否在线
+                bool isOnline = _plcOnlineStatus.TryGetValue(config.PlcCode, out var online) && online;
+                
+                if (!isOnline)
                 {
-                    _plcCommunicationService.Connect(config.PlcCode);
-                }
-
-                if (!_connectionManager.IsConnected(config.PlcCode))
-                {
+                    // PLC离线，不执行采集，等待心跳服务重连
                     return;
                 }
 
@@ -569,6 +568,7 @@ namespace WinformDevFramework.Services.PLCBasic
             catch (Exception ex)
             {
                 _logger?.LogError(ex, $"PLC数据采集异常: PlcCode={config.PlcCode}");
+                // 采集异常时更新状态为离线，心跳服务会检测到并尝试重连
                 _connectionManager.UpdateConnectionStatus(config.PlcID, false);
             }
             finally
@@ -638,12 +638,12 @@ namespace WinformDevFramework.Services.PLCBasic
                             AddressCode = mapping.AddressCode,
                             EquipmentCode = mapping.EquipmentCode,
                             StationCode = mapping.StationCode,
-                            StatusValue = changedValues[i],
+                            StatusValue = changedValues[i],                         
                             CollectTime = DateTime.Now,
                             IsOnline = _plcOnlineStatus.TryGetValue(mapping.PlcCode, out var isOnline) ? isOnline : false,
                              StatusName= _cachedStatusDefs.TryGetValue(mapping.PlcCode, out var defs) 
-                                ? defs.FirstOrDefault(d => d.AddressCode == mapping.AddressCode)?.StatusName 
-                                : null
+                                ? defs.FirstOrDefault(d => d.StatusCode.ToString() == changedValues[i])?.StatusName ?? "未知状态"
+                                : "未知状态"
 
                         };
                         statusList.Add(status);
@@ -763,18 +763,22 @@ namespace WinformDevFramework.Services.PLCBasic
         {
             try
             {
-                switch (dataType)
+                switch (dataType?.ToLower())
                 {
-                    case "Int":
-                    case "Int32":
+                    case "int":
+                    case "int32":
                         var intResult = _plcCommunicationService.ReadInt32(config.PlcCode, address);
                         return intResult.IsSuccess ? intResult.Content.ToString() : null;
-                    case "Int16":
+                    case "int16":
+                    case "short":
                         var shortResult = _plcCommunicationService.ReadInt32(config.PlcCode, address);
                         return shortResult.IsSuccess ? ((short)shortResult.Content).ToString() : null;
-                    case "Float":
+                    case "float":
                         var floatResult = _plcCommunicationService.ReadFloat(config.PlcCode, address);
                         return floatResult.IsSuccess ? floatResult.Content.ToString() : null;
+                    case "byte":
+                        var byteResult = _plcCommunicationService.ReadByte(config.PlcCode, address);
+                        return byteResult.IsSuccess ? byteResult.Content.ToString() : null;
                     default:
                         var defaultResult = _plcCommunicationService.ReadInt32(config.PlcCode, address);
                         return defaultResult.IsSuccess ? defaultResult.Content.ToString() : null;
