@@ -53,12 +53,12 @@ namespace PLCBasic
         /// <summary>
         /// 加工结果
         /// </summary>
-        public string ProcessResult { get; set; }
+        public int PartResult { get; set; }
 
         /// <summary>
         /// 测试模式
         /// </summary>
-        public string TestCode { get; set; }
+        public int TestCode { get; set; }
 
         /// <summary>
         /// 创建时间

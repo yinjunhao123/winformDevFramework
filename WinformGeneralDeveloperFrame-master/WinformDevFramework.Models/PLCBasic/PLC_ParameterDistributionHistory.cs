@@ -36,6 +36,11 @@ namespace PLCBasic
         public string RecipeCode { get; set; }
 
         /// <summary>
+        /// 工站编码
+        /// </summary>
+        public string StationCode { get; set; }
+
+        /// <summary>
         /// 快照时间（即下发前保存的时间）
         /// </summary>
         public DateTime? SnapshotTime { get; set; }

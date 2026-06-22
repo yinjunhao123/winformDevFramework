@@ -9,7 +9,7 @@ namespace PLCBasic
         /// <summary>
         /// 物料信息ID
         /// </summary>
-        public string MaterialInfoId { get; set; }
+        public int MaterialInfoId { get; set; }
 
         /// <summary>
         /// RFID编码
