@@ -221,6 +221,7 @@ namespace WinformDevFramework.Services.PLCBasic
             LoadAlarmAddressCache();
 
             _ = CollectDataLoopAsync();
+            
         }
 
         /// <summary>

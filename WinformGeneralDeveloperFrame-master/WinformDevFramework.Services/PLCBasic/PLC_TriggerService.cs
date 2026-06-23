@@ -54,6 +54,8 @@ namespace WinformDevFramework.Services.PLCBasic
         private readonly IPLC_TriggerParamRepository _plcTriggerParamRepository;
         private readonly IPLC_CollectParametersRepository _plcCollectParametersRepository;
         private readonly IPLC_CollectParametersDetailRepository _plcCollectParametersDetailRepository;
+        private readonly IProcessResultDataRepository _processResultDataRepository;
+
 
         // ============ 心跳服务集成 ============
 
@@ -241,6 +243,7 @@ namespace WinformDevFramework.Services.PLCBasic
             ISocketCommunicationService socketCommunicationService,
             IPLC_TriggerParamRepository  pLC_TriggerParamRepository,
             IPLC_CollectParametersDetailRepository plcCollectParametersDetailRepository, IPLC_CollectParametersRepository plcCollectParametersRepository,
+            IProcessResultDataRepository processResultDataRepository,
             ILogger<PLC_TriggerService> logger)
         {
             _plcCommunicationService = plcCommunicationService;
@@ -271,6 +274,7 @@ namespace WinformDevFramework.Services.PLCBasic
             _plcTriggerParamRepository = pLC_TriggerParamRepository;
             _plcCollectParametersDetailRepository = plcCollectParametersDetailRepository;
             _plcCollectParametersRepository = plcCollectParametersRepository;
+            _processResultDataRepository = processResultDataRepository;
             _logger = logger;
 
             // 初始化性能日志记录器
@@ -495,6 +499,7 @@ namespace WinformDevFramework.Services.PLCBasic
             _pollingThread.IsBackground = true;
             _pollingThread.Name = "PLC_Trigger_Polling";
             _pollingThread.Start();
+            
         }
 
         public void Stop()
@@ -3358,6 +3363,79 @@ namespace WinformDevFramework.Services.PLCBasic
                 int PartResult = readQualityDataPointsDict.TryGetValue("PartResult", out string prStr) && int.TryParse(prStr, out int pr) ? pr : 0;
                 string RecipeVer = CleanPlcString(readQualityDataPointsDict.TryGetValue("RecipeVer", out string rv) ? rv : string.Empty);
                 int testCode = readQualityDataPointsDict.TryGetValue("TestCode", out string tcStr) && int.TryParse(tcStr, out int tc) ? tc : 0;
+
+                string LineID = CleanPlcString(readResultDataPointsDict.TryGetValue("LineID", out string li) ? li : string.Empty);
+                string StationId = CleanPlcString(readResultDataPointsDict.TryGetValue("StationID", out string si) ? si : string.Empty);
+                int PalletNo = readResultDataPointsDict.TryGetValue("PalletNo", out string po) && int.TryParse(po, out int por) ? por : 0;
+                int PalletType = readResultDataPointsDict.TryGetValue("PalletType", out string strpty)&&int.TryParse(strpty,out int pty) ? pty : 0;
+                int PalletStatus = readResultDataPointsDict.TryGetValue("PalletStatus", out string strps) && int.TryParse(strps, out int ps) ? ps : 0;
+
+                // 读取子零件结果数据 (P-Data[1] ~ P-Data[8])
+                // P-Data[1]
+                int SubResult1 = readResultDataPointsDict.TryGetValue("SubResult1", out string sd1) && int.TryParse(sd1, out int sdr1) ? sdr1 : 0;
+                double SubUSL1 = readResultDataPointsDict.TryGetValue("SubUSL1", out string su1) && double.TryParse(su1, out double sur1) ? sur1 : 0;
+                double SubResultValue1 = readResultDataPointsDict.TryGetValue("SubResultValue1", out string srv1) && double.TryParse(srv1, out double srvr1) ? srvr1 : 0;
+                double SubLSL1 = readResultDataPointsDict.TryGetValue("SubLSL1", out string sl1) && double.TryParse(sl1, out double slr1) ? slr1 : 0;
+
+                // P-Data[2]
+                int SubResult2 = readResultDataPointsDict.TryGetValue("SubResult2", out string sd2) && int.TryParse(sd2, out int sdr2) ? sdr2 : 0;
+                double SubUSL2 = readResultDataPointsDict.TryGetValue("SubUSL2", out string su2) && double.TryParse(su2, out double sur2) ? sur2 : 0;
+                double SubResultValue2 = readResultDataPointsDict.TryGetValue("SubResultValue2", out string srv2) && double.TryParse(srv2, out double srvr2) ? srvr2 : 0;
+                double SubLSL2 = readResultDataPointsDict.TryGetValue("SubLSL2", out string sl2) && double.TryParse(sl2, out double slr2) ? slr2 : 0;
+
+                // P-Data[3]
+                int SubResult3 = readResultDataPointsDict.TryGetValue("SubResult3", out string sd3) && int.TryParse(sd3, out int sdr3) ? sdr3 : 0;
+                double SubUSL3 = readResultDataPointsDict.TryGetValue("SubUSL3", out string su3) && double.TryParse(su3, out double sur3) ? sur3 : 0;
+                double SubResultValue3 = readResultDataPointsDict.TryGetValue("SubResultValue3", out string srv3) && double.TryParse(srv3, out double srvr3) ? srvr3 : 0;
+                double SubLSL3 = readResultDataPointsDict.TryGetValue("SubLSL3", out string sl3) && double.TryParse(sl3, out double slr3) ? slr3 : 0;
+
+                // P-Data[4]
+                int SubResult4 = readResultDataPointsDict.TryGetValue("SubResult4", out string sd4) && int.TryParse(sd4, out int sdr4) ? sdr4 : 0;
+                double SubUSL4 = readResultDataPointsDict.TryGetValue("SubUSL4", out string su4) && double.TryParse(su4, out double sur4) ? sur4 : 0;
+                double SubResultValue4 = readResultDataPointsDict.TryGetValue("SubResultValue4", out string srv4) && double.TryParse(srv4, out double srvr4) ? srvr4 : 0;
+                double SubLSL4 = readResultDataPointsDict.TryGetValue("SubLSL4", out string sl4) && double.TryParse(sl4, out double slr4) ? slr4 : 0;
+
+                // P-Data[5]
+                int SubResult5 = readResultDataPointsDict.TryGetValue("SubResult5", out string sd5) && int.TryParse(sd5, out int sdr5) ? sdr5 : 0;
+                double SubUSL5 = readResultDataPointsDict.TryGetValue("SubUSL5", out string su5) && double.TryParse(su5, out double sur5) ? sur5 : 0;
+                double SubResultValue5 = readResultDataPointsDict.TryGetValue("SubResultValue5", out string srv5) && double.TryParse(srv5, out double srvr5) ? srvr5 : 0;
+                double SubLSL5 = readResultDataPointsDict.TryGetValue("SubLSL5", out string sl5) && double.TryParse(sl5, out double slr5) ? slr5 : 0;
+
+                // P-Data[6]
+                int SubResult6 = readResultDataPointsDict.TryGetValue("SubResult6", out string sd6) && int.TryParse(sd6, out int sdr6) ? sdr6 : 0;
+                double SubUSL6 = readResultDataPointsDict.TryGetValue("SubUSL6", out string su6) && double.TryParse(su6, out double sur6) ? sur6 : 0;
+                double SubResultValue6 = readResultDataPointsDict.TryGetValue("SubResultValue6", out string srv6) && double.TryParse(srv6, out double srvr6) ? srvr6 : 0;
+                double SubLSL6 = readResultDataPointsDict.TryGetValue("SubLSL6", out string sl6) && double.TryParse(sl6, out double slr6) ? slr6 : 0;
+
+                // P-Data[7]
+                int SubResult7 = readResultDataPointsDict.TryGetValue("SubResult7", out string sd7) && int.TryParse(sd7, out int sdr7) ? sdr7 : 0;
+                double SubUSL7 = readResultDataPointsDict.TryGetValue("SubUSL7", out string su7) && double.TryParse(su7, out double sur7) ? sur7 : 0;
+                double SubResultValue7 = readResultDataPointsDict.TryGetValue("SubResultValue7", out string srv7) && double.TryParse(srv7, out double srvr7) ? srvr7 : 0;
+                double SubLSL7 = readResultDataPointsDict.TryGetValue("SubLSL7", out string sl7) && double.TryParse(sl7, out double slr7) ? slr7 : 0;
+
+                // P-Data[8]
+                int SubResult8 = readResultDataPointsDict.TryGetValue("SubResult8", out string sd8) && int.TryParse(sd8, out int sdr8) ? sdr8 : 0;
+                double SubUSL8 = readResultDataPointsDict.TryGetValue("SubUSL8", out string su8) && double.TryParse(su8, out double sur8) ? sur8 : 0;
+                double SubResultValue8 = readResultDataPointsDict.TryGetValue("SubResultValue8", out string srv8) && double.TryParse(srv8, out double srvr8) ? srvr8 : 0;
+                double SubLSL8 = readResultDataPointsDict.TryGetValue("SubLSL8", out string sl8) && double.TryParse(sl8, out double slr8) ? slr8 : 0;
+
+                // 读取工步节拍时间 (P-CT_Sub[1] ~ P-CT_Sub[7])
+                double CT_Sub1 = readResultDataPointsDict.TryGetValue("CT_Sub1", out string ct1) && double.TryParse(ct1, out double ctr1) ? ctr1 : 0;
+                double CT_Sub2 = readResultDataPointsDict.TryGetValue("CT_Sub2", out string ct2) && double.TryParse(ct2, out double ctr2) ? ctr2 : 0;
+                double CT_Sub3 = readResultDataPointsDict.TryGetValue("CT_Sub3", out string ct3) && double.TryParse(ct3, out double ctr3) ? ctr3 : 0;
+                double CT_Sub4 = readResultDataPointsDict.TryGetValue("CT_Sub4", out string ct4) && double.TryParse(ct4, out double ctr4) ? ctr4 : 0;
+                double CT_Sub5 = readResultDataPointsDict.TryGetValue("CT_Sub5", out string ct5) && double.TryParse(ct5, out double ctr5) ? ctr5 : 0;
+                double CT_Sub6 = readResultDataPointsDict.TryGetValue("CT_Sub6", out string ct6) && double.TryParse(ct6, out double ctr6) ? ctr6 : 0;
+                double CT_Sub7 = readResultDataPointsDict.TryGetValue("CT_Sub7", out string ct7) && double.TryParse(ct7, out double ctr7) ? ctr7 : 0;
+
+                // 总循环时间
+                double CT_Total = readResultDataPointsDict.TryGetValue("CT_Total", out string ctt) && double.TryParse(ctt, out double cttr) ? cttr : 0;
+
+
+
+
+
+
                 StationProcessInfo stationProcessInfo = GetStationRecipeCurrent(plcCode, stationCode);
                 WipProcessingIrreversible wipProcessingIrreversible = null;
                 _logger.LogInformation($"采集主条码质量过站数据: ProductMode={productModel}, RFIDCode={RFIDCode}, SubPartID1={subPartID1},SubPartID2={subPartID2},SubPartID3={subPartID3}, PartResult={PartResult}, RecipeVer={RecipeVer}, TestCode={testCode}");
@@ -3396,7 +3474,7 @@ namespace WinformDevFramework.Services.PLCBasic
                 }
                 // 验证采集的型号与工站当前生产型号是否一致
                 if (!string.IsNullOrWhiteSpace(productModel))
-                {
+                { 
                     errorMsg = $"未上传型号信息";
                     await WriteErrorStatusToPlc(plcCode, writeDataPoints, 101, errorMsg);
                     DataPushBus.PublishMainPartStationCheck(stationCode, RFIDCode, false, errorMsg);
@@ -3535,6 +3613,43 @@ namespace WinformDevFramework.Services.PLCBasic
                     CreateUser = "System"
                 };
                 await _wipBarCodeProcessRepository.InsertAsync(processRecord);
+
+                var processResultData = new ProcessResultData
+                {
+                    BarCode = wipBarcode.BarCode,
+                    RfidBarcode = RFIDCode,
+                    CT_Sub1 = CT_Sub1,
+                    CT_Sub2 = CT_Sub2,
+                    CT_Sub3 = CT_Sub3,
+                    CT_Sub4 = CT_Sub4,
+                    CT_Sub5 = CT_Sub5,
+                    CT_Sub6 = CT_Sub6,
+                    CT_Sub7 = CT_Sub7,
+                    CT_Total = CT_Total,
+                    LineID = LineID,
+                    PalletNo = PalletNo,
+                    PalletStatus = PalletStatus,
+                    PalletType = PalletType,
+                    StationID = stationCode,
+                    SubLSL1 = SubLSL1,
+                    SubLSL2 = SubLSL2,
+                    SubLSL3 = SubLSL3,
+                    SubLSL4 = SubLSL4,
+                    SubLSL5 = SubLSL5,
+                    SubLSL6 = SubLSL6,
+                    SubLSL7 = SubLSL7,
+                    SubLSL8 = SubLSL8,
+                    SubResultValue1 = SubResultValue1,
+                    SubResultValue2 = SubResultValue2,
+                    SubResultValue3 = SubResultValue3,
+                    SubResultValue4 = SubResultValue4,
+                    SubResultValue5 = SubResultValue5,
+                    SubResultValue6 = SubResultValue6,
+                    SubResultValue7 = SubResultValue7,
+                    SubResultValue8 = SubResultValue8,
+                    ColletTime=DateTime.Now
+                };
+                await _processResultDataRepository.InsertAsync(processResultData);
                 // 更新WipBarCode表
                 await UpdateWipBarCodeStatus(RFIDCode, stationCode);
                 await WriteDataPointsToPlc(plcCode, writeDataPoints, dataToWrite);

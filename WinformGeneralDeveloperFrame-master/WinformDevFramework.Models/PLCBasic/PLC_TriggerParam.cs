@@ -51,7 +51,7 @@ namespace PLCBasic
         public string ParamName { get; set; }
 
         /// <summary>
-        /// 处理方式 collect/MSA
+        /// 处理方式 collect/MSA/real
         /// </summary>
         public string TreatmentType { get; set; }
         /// <summary>
