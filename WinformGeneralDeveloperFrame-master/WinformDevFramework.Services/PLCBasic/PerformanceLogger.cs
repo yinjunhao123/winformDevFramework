@@ -66,14 +66,14 @@ namespace WinformDevFramework.Services.PLCBasic
                             // 计数类指标：只记录非零值
                             if (longValue > 0)
                             {
-                                _logger.LogDebug($"[性能指标] {serviceName}.{metricName} = {longValue}");
+                               // _logger.LogDebug($"[性能指标] {serviceName}.{metricName} = {longValue}");
                             }
                         }
                     }
                     else
                     {
                         // 非数值型指标全部记录
-                        _logger.LogDebug($"[性能指标] {serviceName}.{metricName} = {value}");
+                       // _logger.LogDebug($"[性能指标] {serviceName}.{metricName} = {value}");
                     }
                 }
             }

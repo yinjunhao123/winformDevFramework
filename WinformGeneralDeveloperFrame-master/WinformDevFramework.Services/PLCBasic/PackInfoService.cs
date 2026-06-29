@@ -159,6 +159,19 @@ namespace WinformDevFramework.Services.PLCBasic
         }
 
         /// <summary>
+        /// 根据条码查询所属包装主表ID列表
+        /// </summary>
+        public async Task<List<long>> GetPackInfoIdsByBarCodeAsync(string barCode)
+        {
+            var details =  _packInfoDetailRepository.Query()
+                .Where(d => d.BarCode.Contains(barCode))
+                .Select(d => d.PackInfoId)
+                .Distinct()
+                .ToList();
+            return details;
+        }
+
+        /// <summary>
         /// 删除包装信息（级联删除明细）
         /// </summary>
         public async Task<bool> DeletePackInfoAsync(long id)

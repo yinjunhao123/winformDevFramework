@@ -76,7 +76,7 @@ namespace WinformDevFramework.Services.PLCBasic
             // 订阅PLC状态变更事件
             DataPushBus.PlcStatusChanged += DataPushBus_PlcStatusChanged;
         }
-
+        //实时数据采集
         public void Start()
         {
             if (_isRunning) return;

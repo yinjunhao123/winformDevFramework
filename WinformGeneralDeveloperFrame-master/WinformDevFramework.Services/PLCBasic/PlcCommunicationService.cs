@@ -429,6 +429,20 @@ namespace WinformDevFramework.Services.PLCBasic
             var client = GetClient(plcCode);
             return client?.ReadByte(address) ?? new OperateResult<byte>("PLC客户端不存在");
         }
+
+        /// <summary>
+        ///读取Double数据
+        /// </summary>
+        /// <param name="plcCode"></param>
+        /// <param name="address"></param>
+        /// <returns></returns>
+        /// <exception cref="NotImplementedException"></exception>
+        public OperateResult<Double> ReadDouble(string plcCode, string address)
+        {
+            var client = GetClient(plcCode);
+            return client?.ReadDouble(address) ?? new OperateResult<Double>("PLC客户端不存在");
+        }
+
         /// <summary>
         /// 读取字符串
         /// </summary>

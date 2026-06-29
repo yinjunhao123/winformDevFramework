@@ -220,8 +220,84 @@ namespace WinformDevFramework.Services.PLCBasic
             LoadStatusAddressCache();
             LoadAlarmAddressCache();
 
+            // 服务启动时立即采集一次初始状态，确保页面打开时DB中有数据
+            _ = InitializeStatusAsync();
+
             _ = CollectDataLoopAsync();
-            
+        }
+
+        /// <summary>
+        /// 初始化采集：服务启动时立即读取所有PLC的当前状态并保存到数据库
+        /// 不经过变化检测，直接保存当前值，确保页面打开时能查到初始状态
+        /// 只在PLC在线时才读取，避免连接失败报错
+        /// </summary>
+        private async Task InitializeStatusAsync()
+        {
+            try
+            {
+                // 等待连接建立
+                await Task.Delay(3000);
+
+                foreach (var kvp in _cachedStatusAddresses)
+                {
+                    var plcCode = kvp.Key;
+                    var statusCache = kvp.Value;
+
+                    if (statusCache.TotalCount == 0)
+                        continue;
+
+                    // 检查PLC是否在线（从心跳服务获取状态）
+                    if (!_plcOnlineStatus.TryGetValue(plcCode, out var isOnline) || !isOnline)
+                    {
+                        _logger?.LogInformation($"PLC {plcCode} 未连接，跳过初始状态采集");
+                        continue;
+                    }
+
+                    var configs = _plcConfigRepository.Query().ToList();
+                    var config = configs.FirstOrDefault(c => c.PlcCode == plcCode);
+                    if (config == null)
+                        continue;
+
+                    // 批量读取所有状态地址
+                    var results = await ReadStatusBatchAsync(config, statusCache);
+
+                    // 直接保存所有当前值（不做变化检测）
+                    var statusList = new List<PLC_RealTimeStatus>();
+                    var defs = _cachedStatusDefs.TryGetValue(plcCode, out var d) ? d : null;
+
+                    for (int i = 0; i < results.Length && i < statusCache.Mappings.Count; i++)
+                    {
+                        var mapping = statusCache.Mappings[i];
+                        var currentValue = results[i];
+                        var cacheKey = $"{plcCode}_{mapping.AddressCode}";
+
+                        // 初始化缓存值
+                        _lastStatusValues[cacheKey] = currentValue;
+
+                        statusList.Add(new PLC_RealTimeStatus
+                        {
+                            PlcCode = mapping.PlcCode,
+                            AddressCode = mapping.AddressCode,
+                            EquipmentCode = mapping.EquipmentCode,
+                            StationCode = mapping.StationCode,
+                            StatusValue = currentValue,
+                            StatusName = defs?.FirstOrDefault(d => d.StatusCode.ToString() == currentValue)?.StatusName ?? "未知状态",
+                            CollectTime = DateTime.Now,
+                            IsOnline = true
+                        });
+                    }
+
+                    if (statusList.Any())
+                    {
+                        await _statusRepository.InsertAsync(statusList);
+                        _logger?.LogInformation($"PLC {plcCode} 初始状态采集完成: {statusList.Count} 条记录已保存");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "初始化状态采集失败");
+            }
         }
 
         /// <summary>

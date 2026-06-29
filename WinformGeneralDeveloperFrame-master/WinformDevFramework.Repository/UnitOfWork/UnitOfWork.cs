@@ -1,4 +1,4 @@
-﻿using Dm.Config;
+using Dm.Config;
 using SqlSugar;
 using SqlSugar.IOC;
 using WinformDevFramework.IRepository.UnitOfWork;
@@ -9,13 +9,9 @@ namespace WinformDevFramework.Repository.UnitOfWork
     {
         private readonly ISqlSugarClient _sqlSugarClient;
 
-        //public UnitOfWork(ISqlSugarClient sqlSugarClient)
-        //{
-        //    _sqlSugarClient = sqlSugarClient;
-        //}
-        public UnitOfWork()
+        public UnitOfWork(ISqlSugarClient sqlSugarClient)
         {
-            _sqlSugarClient = DbScoped.SugarScope;
+            _sqlSugarClient = sqlSugarClient;
         }
 
         /// <summary>

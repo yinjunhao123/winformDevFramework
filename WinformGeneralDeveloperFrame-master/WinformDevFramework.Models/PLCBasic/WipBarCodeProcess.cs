@@ -51,7 +51,7 @@ namespace PLCBasic
         public string ThirdSubBarCode { get; set; }
 
         /// <summary>
-        /// 加工结果
+        /// 加工结果  0-未作，1-合格，2-不合格
         /// </summary>
         public int PartResult { get; set; }
 

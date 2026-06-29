@@ -8,10 +8,14 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Data;
 using System.Diagnostics;
+using System.Threading.Channels;
 using System.Globalization;
 using System.Linq;
 using System.Threading;
 using System.IO;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
 using WinformDevFramework.Basic.IRepository;
 using WinformDevFramework.Basic.Repository;
 using WinformDevFramework.IRepository;
@@ -20,6 +24,8 @@ using WinformDevFramework.IServices.PLCBasic;
 using WinformDevFramework.Models.Basic;
 using WinformDevFramework.Models.PLCBasic;
 using System.Text;
+using Newtonsoft.Json;
+using System.Drawing.Text;
 
 namespace WinformDevFramework.Services.PLCBasic
 {
@@ -54,7 +60,8 @@ namespace WinformDevFramework.Services.PLCBasic
         private readonly IPLC_TriggerParamRepository _plcTriggerParamRepository;
         private readonly IPLC_CollectParametersRepository _plcCollectParametersRepository;
         private readonly IPLC_CollectParametersDetailRepository _plcCollectParametersDetailRepository;
-        private readonly IProcessResultDataRepository _processResultDataRepository;
+        private readonly IWipProcessDataRepository _wipProcessDataRepository;
+        private readonly IPLC_CalibraCollectRepository _calibraCollectRepository;
 
 
         // ============ 心跳服务集成 ============
@@ -67,16 +74,16 @@ namespace WinformDevFramework.Services.PLCBasic
         /// <summary>
         /// PLC连接状态缓存（从心跳服务获取）
         /// </summary>
-        private readonly Dictionary<string, bool> _plcOnlineStatus = new Dictionary<string, bool>();
+        private readonly ConcurrentDictionary<string, bool> _plcOnlineStatus = new ConcurrentDictionary<string, bool>();
 
         private Thread _pollingThread;
         private volatile bool _isRunning;
         private CancellationTokenSource _pollingCancellationToken;
         private int _pollingIntervalMs = 100;
 
-        private readonly Dictionary<string, EventTriggerConfig> _eventConfigCache = new Dictionary<string, EventTriggerConfig>();
-        private readonly Dictionary<string, bool> _lastTriggerStatus = new Dictionary<string, bool>();
-        private readonly Dictionary<string, PLC_Address> _deviceStatusCache = new Dictionary<string, PLC_Address>();
+        private readonly ConcurrentDictionary<string, EventTriggerConfig> _eventConfigCache = new ConcurrentDictionary<string, EventTriggerConfig>();
+        private readonly ConcurrentDictionary<string, bool> _lastTriggerStatus = new ConcurrentDictionary<string, bool>();
+        private readonly ConcurrentDictionary<string, PLC_Address> _deviceStatusCache = new ConcurrentDictionary<string, PLC_Address>();
         private readonly Dictionary<int, List<PLC_Event_Data_Detail>> _eventDetailCache = new Dictionary<int, List<PLC_Event_Data_Detail>>();
 
         // ============ 工站工艺信息缓存（从PLC_StationRecipeCurrent表加载） ============
@@ -97,7 +104,7 @@ namespace WinformDevFramework.Services.PLCBasic
         /// <summary>
         /// MES模式地址缓存：Key = PlcCode_StationCode，Value = PLC地址配置
         /// </summary>
-        private readonly Dictionary<string, PLC_Address> _mesModeAddressCache = new Dictionary<string, PLC_Address>();
+        private readonly ConcurrentDictionary<string, PLC_Address> _mesModeAddressCache = new ConcurrentDictionary<string, PLC_Address>();
 
         /// <summary>
         /// 上次MES模式状态：Key = PlcCode_StationCode，Value = 上次模式状态
@@ -109,8 +116,27 @@ namespace WinformDevFramework.Services.PLCBasic
         // Socket通讯服务（用于与外部设备通信，接收图片数据）
         private readonly ISocketCommunicationService _socketCommunicationService;
 
-        // 限流信号量，最多同时处理12个事件
-        private readonly SemaphoreSlim _eventSemaphore = new SemaphoreSlim(12, 20);
+        // ============ Channel事件队列（替代信号量，避免事件丢失） ============
+
+        /// <summary>
+        /// 事件队列：有界Channel，最多缓存200个待处理事件
+        /// Item1=事件参数, Item2=flag(MES在线/离线)
+        /// </summary>
+        private readonly Channel<(PlcEventTriggeredEventArgs Event, bool Flag)> _eventChannel =
+            Channel.CreateBounded<(PlcEventTriggeredEventArgs, bool)>(new BoundedChannelOptions(200)
+            {
+                FullMode = BoundedChannelFullMode.Wait
+            });
+
+        /// <summary>
+        /// Worker消费者任务列表
+        /// </summary>
+        private readonly List<Task> _eventWorkers = new List<Task>();
+
+        /// <summary>
+        /// Worker消费者数量
+        /// </summary>
+        private const int EventWorkerCount = 12;
 
         // ============ 轮询间隔动态调整 ============
 
@@ -243,7 +269,7 @@ namespace WinformDevFramework.Services.PLCBasic
             ISocketCommunicationService socketCommunicationService,
             IPLC_TriggerParamRepository  pLC_TriggerParamRepository,
             IPLC_CollectParametersDetailRepository plcCollectParametersDetailRepository, IPLC_CollectParametersRepository plcCollectParametersRepository,
-            IProcessResultDataRepository processResultDataRepository,
+            IPLC_CalibraCollectRepository calibraCollectRepository, IWipProcessDataRepository wipProcessDataRepository,
             ILogger<PLC_TriggerService> logger)
         {
             _plcCommunicationService = plcCommunicationService;
@@ -274,7 +300,8 @@ namespace WinformDevFramework.Services.PLCBasic
             _plcTriggerParamRepository = pLC_TriggerParamRepository;
             _plcCollectParametersDetailRepository = plcCollectParametersDetailRepository;
             _plcCollectParametersRepository = plcCollectParametersRepository;
-            _processResultDataRepository = processResultDataRepository;
+            _calibraCollectRepository = calibraCollectRepository;
+            _wipProcessDataRepository = wipProcessDataRepository;
             _logger = logger;
 
             // 初始化性能日志记录器
@@ -299,20 +326,17 @@ namespace WinformDevFramework.Services.PLCBasic
                 return;
             }
 
-            lock (_plcOnlineStatus)
+            bool previousStatus;
+            bool hadKey = _plcOnlineStatus.TryGetValue(e.PlcCode, out previousStatus);
+
+            // 更新缓存
+            _plcOnlineStatus[e.PlcCode] = e.IsOnline;
+
+            // 只有状态变化时才记录日志
+            if (!hadKey || previousStatus != e.IsOnline)
             {
-                bool previousStatus;
-                bool hadKey = _plcOnlineStatus.TryGetValue(e.PlcCode, out previousStatus);
-
-                // 更新缓存
-                _plcOnlineStatus[e.PlcCode] = e.IsOnline;
-
-                // 只有状态变化时才记录日志
-                if (!hadKey || previousStatus != e.IsOnline)
-                {
-                    string previousStr = hadKey ? (previousStatus ? "在线" : "离线") : "未知";
-                    _logger.LogInformation($"PLC状态变化: {e.PlcCode} -> {(e.IsOnline ? "在线" : "离线")} (之前: {previousStr})");
-                }
+                string previousStr = hadKey ? (previousStatus ? "在线" : "离线") : "未知";
+                _logger.LogInformation($"PLC状态变化: {e.PlcCode} -> {(e.IsOnline ? "在线" : "离线")} (之前: {previousStr})");
             }
         }
 
@@ -324,12 +348,9 @@ namespace WinformDevFramework.Services.PLCBasic
         private bool CheckPlcConnectionStatus(string plcCode)
         {
             // 优先使用心跳服务的状态缓存
-            lock (_plcOnlineStatus)
+            if (_plcOnlineStatus.TryGetValue(plcCode, out bool isOnline))
             {
-                if (_plcOnlineStatus.TryGetValue(plcCode, out bool isOnline))
-                {
-                    return isOnline;
-                }
+                return isOnline;
             }
 
             // 心跳服务尚未提供状态时，默认信任PLC在线
@@ -357,10 +378,12 @@ namespace WinformDevFramework.Services.PLCBasic
                 "ProcessDowning",    // 不可逆工艺下降沿
                 "Repair",            // 返修上线上升沿
                 "Calibra_Data",     // 标定参数
-                "Bounce"//跳动
-
+                "CalibraDown_Data", // 标定参数下降沿
+                "PrintExchange",    // 打印交换
+                "ParameterDistributionDown", // MES条码进站更新参数
+                "Bounce",           // 跳动
+                "BounceDown"        // 跳动下降沿
             };
-
             foreach (var eventType in eventTypes)
             {
                 _circuitBreakers[eventType] = new CircuitBreaker(
@@ -489,6 +512,9 @@ namespace WinformDevFramework.Services.PLCBasic
                 }
             });
 
+            // 启动事件处理Worker消费者
+            StartEventWorkers();
+
             // 启动离线心跳线程（每5秒执行一次）
             _heartbeatThread = new Thread(async () => await HeartbeatLoop());
             _heartbeatThread.IsBackground = true;
@@ -510,68 +536,98 @@ namespace WinformDevFramework.Services.PLCBasic
             _pollingCancellationToken?.Dispose();
             _pollingCancellationToken = null;
 
+            // 关闭事件队列，等待Worker处理完剩余事件
+            _eventChannel.Writer.TryComplete();
+            Task.WaitAll(_eventWorkers.ToArray(), 10000);
+            _eventWorkers.Clear();
+            _logger.LogInformation("事件处理Worker已停止");
+
             // 停止离线心跳线程
             _heartbeatThread?.Join(5000);
             _logger.LogInformation("离线心跳线程已停止");
+        }
+
+        /// <summary>
+        /// 启动事件处理Worker消费者
+        /// 从Channel队列中读取事件并处理，替代原来的信号量模式
+        /// </summary>
+        private void StartEventWorkers()
+        {
+            for (int i = 0; i < EventWorkerCount; i++)
+            {
+                var workerTask = Task.Run(async () =>
+                {
+                    await foreach (var (eventData, flag) in _eventChannel.Reader.ReadAllAsync())
+                    {
+                        try
+                        {
+                            await HandleEventInternalAsync(eventData, flag);
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogError(ex, $"Worker处理事件异常: EventId={eventData.EventId}, EventType={eventData.EventType}");
+                        }
+                    }
+                });
+                _eventWorkers.Add(workerTask);
+            }
+            _logger.LogInformation($"已启动 {EventWorkerCount} 个事件处理Worker");
         }
 
         public void ReloadConfig()
         {
             try
             {
-                lock (_eventConfigCache)
+                _eventConfigCache.Clear();
+                _lastTriggerStatus.Clear();
+                _deviceStatusCache.Clear();
+                _eventDetailCache.Clear();
+
+                // ============ 工站工艺信息缓存清理 ============
+                _stationProcessCache.Clear();  // 工站工艺信息缓存
+                
+                // ============ MES模式缓存清理 ============
+                _mesModeCache.Clear();
+                _mesModeAddressCache.Clear();
+                _lastMesModeStatus.Clear();
+
+                var eventConfigs = _eventMasterRepository.Query().ToList();
+                _logger.LogInformation($"开始加载事件触发配置，共 {eventConfigs.Count} 条");
+
+                foreach (var config in eventConfigs)
                 {
-                    _eventConfigCache.Clear();
-                    _lastTriggerStatus.Clear();
-                    _deviceStatusCache.Clear();
-                    _eventDetailCache.Clear();
-
-                    // ============ 工站工艺信息缓存清理 ============
-                    _stationProcessCache.Clear();  // 工站工艺信息缓存
-                    
-                    // ============ MES模式缓存清理 ============
-                    _mesModeCache.Clear();
-                    _mesModeAddressCache.Clear();
-                    _lastMesModeStatus.Clear();
-
-                    var eventConfigs = _eventMasterRepository.Query().ToList();
-                    _logger.LogInformation($"开始加载事件触发配置，共 {eventConfigs.Count} 条");
-
-                    foreach (var config in eventConfigs)
+                    string eventCacheKey = BuildEventConfigCacheKey(config.PlcCode, config.StationCode, config.TriggerAddress, config.EventId);
+                    _eventConfigCache[eventCacheKey] = new EventTriggerConfig
                     {
-                        string eventCacheKey = BuildEventConfigCacheKey(config.PlcCode, config.StationCode, config.TriggerAddress, config.EventId);
-                        _eventConfigCache[eventCacheKey] = new EventTriggerConfig
-                        {
-                            EventId = config.EventId,
-                            PlcCode = config.PlcCode,
-                            StationCode = config.StationCode,
-                            TriggerAddress = config.TriggerAddress,
-                            TriggerAddressType = config.TriggerAddressType,
-                            EventType = config.EventType,
-                            TriggerEdgeType = config.TriggerEdgeType,
-                            Description = config.Description
-                        };
+                        EventId = config.EventId,
+                        PlcCode = config.PlcCode,
+                        StationCode = config.StationCode,
+                        TriggerAddress = config.TriggerAddress,
+                        TriggerAddressType = config.TriggerAddressType,
+                        EventType = config.EventType,
+                        TriggerEdgeType = config.TriggerEdgeType,
+                        Description = config.Description
+                    };
 
-                        string statusCacheKey = BuildTriggerStatusCacheKey(config.PlcCode, config.StationCode, config.TriggerAddress);
-                        _lastTriggerStatus[statusCacheKey] = false;
+                    string statusCacheKey = BuildTriggerStatusCacheKey(config.PlcCode, config.StationCode, config.TriggerAddress);
+                    _lastTriggerStatus[statusCacheKey] = false;
 
-                        var eventDetails = _eventDetailRepository.Query()
-                            .Where(d => d.EventId == config.EventId)
-                            .OrderBy(d => d.SortOrder)
-                            .ToList();
-                        _eventDetailCache[config.EventId] = eventDetails;
-                        _logger.LogDebug($"事件ID {config.EventId} 加载了 {eventDetails.Count} 个数据点配置");
+                    var eventDetails = _eventDetailRepository.Query()
+                        .Where(d => d.EventId == config.EventId)
+                        .OrderBy(d => d.SortOrder)
+                        .ToList();
+                    _eventDetailCache[config.EventId] = eventDetails;
+                    _logger.LogDebug($"事件ID {config.EventId} 加载了 {eventDetails.Count} 个数据点配置");
 
-                        LoadDeviceStatusConfig(config.PlcCode, config.StationCode);
-                        
-                        // 加载MES模式地址配置（全局配置，每个PLC只有一个）
-                        LoadMesModeConfig(config.PlcCode);
-                    }
-
-                    LoadStationRecipeCurrent();
-
-                    _logger.LogInformation($"事件触发配置加载完成，共 {_eventConfigCache.Count} 个触发点，{_deviceStatusCache.Count} 个设备状态配置，{_mesModeCache.Count} 个MES模式配置");
+                    LoadDeviceStatusConfig(config.PlcCode, config.StationCode);
+                    
+                    // 加载MES模式地址配置（全局配置，每个PLC只有一个）
+                    LoadMesModeConfig(config.PlcCode);
                 }
+
+                LoadStationRecipeCurrent();
+
+                _logger.LogInformation($"事件触发配置加载完成，共 {_eventConfigCache.Count} 个触发点，{_deviceStatusCache.Count} 个设备状态配置，{_mesModeCache.Count} 个MES模式配置");
             }
             catch (Exception ex)
             {
@@ -946,11 +1002,7 @@ namespace WinformDevFramework.Services.PLCBasic
             try
             {
                 // 1. 获取所有MES模式配置
-                List<string> mesModeKeys;
-                lock (_mesModeAddressCache)
-                {
-                    mesModeKeys = _mesModeAddressCache.Keys.ToList();
-                }
+                List<string> mesModeKeys = _mesModeAddressCache.Keys.ToList();
 
                 if (!mesModeKeys.Any())
                     return;
@@ -1167,7 +1219,7 @@ namespace WinformDevFramework.Services.PLCBasic
                         _logger.LogInformation("轮询任务被取消");
                         break;
                     }
-                    _logger.LogDebug($"轮询超时，继续下一轮");
+                    _logger.LogDebug($"发生异常，轮询超时，继续下一轮");
                 }
                 catch (OperationCanceledException)
                 {
@@ -1178,7 +1230,7 @@ namespace WinformDevFramework.Services.PLCBasic
                         _logger.LogInformation("轮询任务被取消");
                         break;
                     }
-                    _logger.LogDebug($"轮询超时，继续下一轮");
+                    _logger.LogDebug($"发生异常，轮询超时，继续下一轮");
                 }
                 catch (Exception ex)
                 {
@@ -1296,11 +1348,7 @@ namespace WinformDevFramework.Services.PLCBasic
             try
             {
                 // 获取所有MES模式配置
-                List<string> mesModeKeys;
-                lock (_mesModeAddressCache)
-                {
-                    mesModeKeys = _mesModeAddressCache.Keys.ToList();
-                }
+                List<string> mesModeKeys = _mesModeAddressCache.Keys.ToList();
 
                 if (!mesModeKeys.Any())
                 {
@@ -1331,13 +1379,11 @@ namespace WinformDevFramework.Services.PLCBasic
                         onlineCount++;
                     }
                 }
-
                 //_logger.LogInformation($"[MES模式检查] 完成，在线: {onlineCount}, 离线: {offlineCount}, 执行轮询: {hasOfflineStation}");
-
                 // 只要有任何工站处于MES离线模式，就执行定时轮询
                 if (hasOfflineStation)
                 {
-                    _logger.LogDebug("[MES模式检查] 存在MES离线PLC，执行定时任务轮询");
+                    //_logger.LogDebug("[MES模式检查] 存在MES离线PLC，执行定时任务轮询");
                     await CheckAllTriggersAsync(false);
                 }
                 else
@@ -1355,12 +1401,7 @@ namespace WinformDevFramework.Services.PLCBasic
 
         private async Task CheckAllTriggersAsync(bool flag)
         {
-            List<EventTriggerConfig> configsToCheck;
-
-            lock (_eventConfigCache)
-            {
-                configsToCheck = _eventConfigCache.Values.ToList();
-            }
+            List<EventTriggerConfig> configsToCheck = _eventConfigCache.Values.ToList();
 
             if (!configsToCheck.Any())
             {
@@ -1377,7 +1418,7 @@ namespace WinformDevFramework.Services.PLCBasic
             // 记录PLC分组数量
             PerformanceLogger.Log("TriggerService.CheckAllTriggers", "PlcGroupCount", plcGroups.Count);
 
-            _logger.LogDebug($"[触发检查] 开始，模式={(flag ? "MES在线" : "MES离线")}，PLC分组数: {plcGroups.Count}，触发点总数: {configsToCheck.Count}");
+           // _logger.LogDebug($"[触发检查] 开始，模式={(flag ? "MES在线" : "MES离线")}，PLC分组数: {plcGroups.Count}，触发点总数: {configsToCheck.Count}");
 
             var stopwatch = global::System.Diagnostics.Stopwatch.StartNew();
 
@@ -1407,13 +1448,13 @@ namespace WinformDevFramework.Services.PLCBasic
             // 记录性能日志
             PerformanceLogger.Log("TriggerService.CheckAllTriggers", "TotalProcessingTimeMs", stopwatch.ElapsedMilliseconds);
 
-            _logger.LogDebug($"[触发检查] 完成，耗时: {stopwatch.ElapsedMilliseconds}ms");
+         //   _logger.LogDebug($"[触发检查] 完成，耗时: {stopwatch.ElapsedMilliseconds}ms");
 
             // 如果处理时间超过轮询间隔的50%，记录警告
-            if (stopwatch.ElapsedMilliseconds > _pollingIntervalMs * 0.5)
-            {
-                _logger.LogWarning($"[触发检查] 耗时 {stopwatch.ElapsedMilliseconds}ms，超过轮询间隔 {_pollingIntervalMs}ms 的50%，建议优化");
-            }
+            //if (stopwatch.ElapsedMilliseconds > _pollingIntervalMs * 0.5)
+            //{
+            //    _logger.LogWarning($"[触发检查] 耗时 {stopwatch.ElapsedMilliseconds}ms，超过轮询间隔 {_pollingIntervalMs}ms 的50%，建议优化");
+            //}
         }
 
         /// <summary>
@@ -1427,7 +1468,7 @@ namespace WinformDevFramework.Services.PLCBasic
 
             try
             {
-                _logger.LogDebug($"[PLC处理] 开始处理 PLC={plcCode}, 触发点数={configs.Count}, 模式={(flag ? "MES在线" : "MES离线")}");
+               // _logger.LogDebug($"[PLC处理] 开始处理 PLC={plcCode}, 触发点数={configs.Count}, 模式={(flag ? "MES在线" : "MES离线")}");
 
                 // 检查连接状态（复用心跳服务状态）
                 if (!CheckPlcConnectionStatus(plcCode))
@@ -1466,14 +1507,14 @@ namespace WinformDevFramework.Services.PLCBasic
                     try
                     {
                         var batchStopwatch = global::System.Diagnostics.Stopwatch.StartNew();
-                        _logger.LogDebug($"[PLC处理] PLC {plcCode} 开始批量读取 {uniqueAddresses.Count} 个唯一地址");
+                        //_logger.LogDebug($"[PLC处理] PLC {plcCode} 开始批量读取 {uniqueAddresses.Count} 个唯一地址");
                         bool[] results = await _plcCommunicationService.ReadBatchAsync(plcCode, uniqueAddresses);
                         batchStopwatch.Stop();
 
                         PerformanceLogger.Log($"TriggerService.ProcessPlcGroup.{plcCode}", "BatchReadTimeMs", batchStopwatch.ElapsedMilliseconds);
                         PerformanceLogger.Log($"TriggerService.ProcessPlcGroup.{plcCode}", "BatchReadCount", uniqueAddresses.Count);
 
-                        _logger.LogDebug($"[PLC处理] PLC {plcCode} 批量读取完成，耗时={batchStopwatch.ElapsedMilliseconds}ms");
+                        //_logger.LogDebug($"[PLC处理] PLC {plcCode} 批量读取完成，耗时={batchStopwatch.ElapsedMilliseconds}ms");
 
                         // 保存读取结果
                         for (int i = 0; i < uniqueAddresses.Count && i < results.Length; i++)
@@ -1510,14 +1551,7 @@ namespace WinformDevFramework.Services.PLCBasic
                         {
                             // 获取该地址的上一次状态（所有事件共享同一个lastStatus）
                             string statusCacheKey = BuildTriggerStatusCacheKey(plcCode, group.First().StationCode, group.Key);
-                            bool lastStatus;
-                            lock (_lastTriggerStatus)
-                            {
-                                if (!_lastTriggerStatus.TryGetValue(statusCacheKey, out lastStatus))
-                                {
-                                    lastStatus = false;
-                                }
-                            }
+                            _lastTriggerStatus.TryGetValue(statusCacheKey, out bool lastStatus);
 
                             // 处理该地址的所有事件配置（使用相同的 lastStatus）
                             foreach (var config in group)
@@ -1527,10 +1561,7 @@ namespace WinformDevFramework.Services.PLCBasic
                             }
 
                             // 所有事件处理完后，统一更新缓存
-                            lock (_lastTriggerStatus)
-                            {
-                                _lastTriggerStatus[statusCacheKey] = currentStatus;
-                            }
+                            _lastTriggerStatus[statusCacheKey] = currentStatus;
                         }
                     }
                 }
@@ -1554,20 +1585,20 @@ namespace WinformDevFramework.Services.PLCBasic
                 stopwatch.Stop();
 
                 // 记录详细的性能指标
-                PerformanceLogger.Log($"TriggerService.ProcessPlcGroup.{plcCode}", "ProcessingTimeMs", stopwatch.ElapsedMilliseconds);
-                PerformanceLogger.Log($"TriggerService.ProcessPlcGroup.{plcCode}", "TriggerProcessedCount", triggerCount);
-                PerformanceLogger.Log($"TriggerService.ProcessPlcGroup.{plcCode}", "ErrorCount", errorCount);
-                PerformanceLogger.Log($"TriggerService.ProcessPlcGroup.{plcCode}", "Status", "Success");
+                //PerformanceLogger.Log($"TriggerService.ProcessPlcGroup.{plcCode}", "ProcessingTimeMs", stopwatch.ElapsedMilliseconds);
+                //PerformanceLogger.Log($"TriggerService.ProcessPlcGroup.{plcCode}", "TriggerProcessedCount", triggerCount);
+                //PerformanceLogger.Log($"TriggerService.ProcessPlcGroup.{plcCode}", "ErrorCount", errorCount);
+                //PerformanceLogger.Log($"TriggerService.ProcessPlcGroup.{plcCode}", "Status", "Success");
 
                 // 如果处理时间超过50ms，记录详细信息
                 if (stopwatch.ElapsedMilliseconds > 50)
                 {
                     _logger.LogInformation($"[PLC处理] PLC {plcCode} 处理完成: 触发点={triggerCount}, 错误={errorCount}, 耗时={stopwatch.ElapsedMilliseconds}ms");
                 }
-                else
-                {
-                    _logger.LogDebug($"[PLC处理] PLC {plcCode} 处理完成: 触发点={triggerCount}, 错误={errorCount}, 耗时={stopwatch.ElapsedMilliseconds}ms");
-                }
+                //else
+                //{
+                //    _logger.LogDebug($"[PLC处理] PLC {plcCode} 处理完成: 触发点={triggerCount}, 错误={errorCount}, 耗时={stopwatch.ElapsedMilliseconds}ms");
+                //}
             }
             catch (Exception ex)
             {
@@ -1613,17 +1644,8 @@ namespace WinformDevFramework.Services.PLCBasic
                 string edgeType = isRisingEdge ? "Rising" : "Falling";
                 _logger.LogInformation($"检测到事件触发: EventId={config.EventId}, EventType={config.EventType}, PlcCode={config.PlcCode}, StationCode={config.StationCode}, EdgeType={edgeType}");
 
-                _ = Task.Run(async () =>
-                {
-                    try
-                    {
-                        await HandleEventAsync(triggerEvent, flag);
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogError(ex, $"事件处理异常: EventId={triggerEvent.EventId}, EventType={triggerEvent.EventType}");
-                    }
-                });
+                // 写入Channel队列，由Worker消费者处理（替代Task.Run+信号量）
+                _eventChannel.Writer.TryWrite((triggerEvent, flag));
             }
         }
 
@@ -1634,14 +1656,7 @@ namespace WinformDevFramework.Services.PLCBasic
         {
             string statusCacheKey = BuildTriggerStatusCacheKey(config.PlcCode, config.StationCode, config.TriggerAddress);
 
-            bool lastStatus;
-            lock (_lastTriggerStatus)
-            {
-                if (!_lastTriggerStatus.TryGetValue(statusCacheKey, out lastStatus))
-                {
-                    lastStatus = false;
-                }
-            }
+            _lastTriggerStatus.TryGetValue(statusCacheKey, out bool lastStatus);
 
             bool shouldTrigger = false;
             if (config.IsFallingEdgeTrigger)
@@ -1670,137 +1685,217 @@ namespace WinformDevFramework.Services.PLCBasic
                 string edgeType = isRisingEdge ? "Rising" : "Falling";
                 _logger.LogInformation($"检测到事件触发: EventId={config.EventId}, EventType={config.EventType}, PlcCode={config.PlcCode}, StationCode={config.StationCode}, EdgeType={edgeType}");
 
-                _ = Task.Run(async () =>
-                {
-                    try
-                    {
-                        await HandleEventAsync(triggerEvent, flag);
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogError(ex, $"事件处理异常: EventId={triggerEvent.EventId}, EventType={triggerEvent.EventType}");
-                    }
-                });
+                // 写入Channel队列，由Worker消费者处理（替代Task.Run+信号量）
+                _eventChannel.Writer.TryWrite((triggerEvent, flag));
             }
 
-            lock (_lastTriggerStatus)
-            {
-                _lastTriggerStatus[statusCacheKey] = currentStatus;
-            }
+            _lastTriggerStatus[statusCacheKey] = currentStatus;
         }
 
         /// <summary>
-        /// 异步处理事件
+        /// 异步处理事件（旧方法，使用信号量限流 - 已注释，改用Channel队列）
         /// </summary>
-        private async Task HandleEventAsync(PlcEventTriggeredEventArgs e,bool flag)
+        //private async Task HandleEventAsync(PlcEventTriggeredEventArgs e,bool flag)
+        //{
+        //    // 尝试获取信号量，最多等待100ms
+        //    if (!await _eventSemaphore.WaitAsync(TimeSpan.FromMilliseconds(100)))
+        //    {
+        //        _logger.LogWarning($"事件处理队列已满，丢弃事件: EventId={e.EventId}, EventType={e.EventType}");
+        //        return;
+        //    }
+
+        //    try
+        //    {
+        //        // 检查断路器状态
+        //        if (!IsEventAllowed(e.EventType))
+        //        {
+        //            var remainingTime = GetCircuitBreakerRemainingTime(e.EventType);
+        //            _logger.LogWarning($"事件[{e.EventType}]已熔断，拒绝处理，剩余熔断时间: {remainingTime}ms");
+        //            return;
+        //        }
+
+        //        bool eventHandledSuccessfully = false;
+
+        //        if (!flag)   //mes离线处理事件
+        //        {
+        //            switch (e.EventType)
+        //            {
+        //                case "BatchCheckIn"://批次校验上升沿触发
+        //                case "BatchCheckOut"://批次校验下降沿触发
+        //                    await HandleBatchCheckAsync(e, e.IsRisingEdge);
+        //                    eventHandledSuccessfully = true;
+        //                    break;
+        //                case "MainCheckIn"://主条码进站校验上升沿触发
+        //                case "MainCheckDownIn"://主条码进站校验下降沿触发
+        //                    await HandleMainCheckInAsync(e, e.IsRisingEdge);
+        //                    eventHandledSuccessfully = true;
+        //                    break;
+        //                case "SubCheckIn"://子条码进站校验上升沿触发
+        //                case "SubCheckDownIn"://子条码进站校验下降沿触发
+        //                    await HandleSubCheckAsync(e, e.IsRisingEdge);
+        //                    eventHandledSuccessfully = true;
+        //                    break;
+        //                case "MainCheckOut"://采集加工数据上升沿触发
+        //                case "MainCheckDownOut"://采集加工数据下降沿触发
+        //                    await HandleMainCheckOutAsync(e, e.IsRisingEdge);
+        //                    eventHandledSuccessfully = true;
+        //                    break;
+        //                case "Processing"://表明工件已经入不可逆工艺 上升沿
+        //                case "ProcessDowning"://表明工件已经入不可逆工艺 下降沿
+        //                    await HandleProcessingAsync(e, e.IsRisingEdge);
+        //                    eventHandledSuccessfully = true;
+        //                    break;
+        //                //标定参数
+        //                case "Calibra_Data":
+        //                case "CalibraDown_Data":
+        //                    await HandleCalibraDataAsync(e,e.IsRisingEdge);
+        //                    eventHandledSuccessfully = true;
+        //                    break;
+        //                //打印上升沿处理事件
+        //                case "PrintExchange":
+        //                    await HandlePrintExchangeAsync(e);
+        //                    eventHandledSuccessfully = true;
+        //                    break;
+        //                case "Bounce"://跳动上升沿触发
+        //                case "BounceDown"://跳动下降沿触发
+        //                    await HandleBounceAsync(e,e.IsRisingEdge);
+        //                    eventHandledSuccessfully = true;
+        //                    break;
+        //                default:
+        //                    _logger.LogWarning($"未知的事件类型: {e.EventType}");
+        //                    break;
+        //            }
+        //        }
+        //        else
+        //        {
+        //            switch (e.EventType)
+        //            {
+        //                //主条码进站校验，保存下发参数
+        //                case "ParameterDistributionDown":
+        //                        await HandleParameterDistributionDownAsync(e);
+        //                        eventHandledSuccessfully = true;
+        //                    break;
+        //                case "Bounce"://跳动上升沿触发
+        //                case "BounceDown"://跳动下降沿触发
+        //                    await HandleBounceAsync(e, e.IsRisingEdge);
+        //                    eventHandledSuccessfully = true;
+        //                    break;
+        //                case "BitwiseAND"://位移压力
+        //                    break;
+        //                case "ScrewDown"://拧紧
+        //                    break;  
+        //            }
+        //      }
+                
+
+        //        // 事件处理成功，记录成功
+        //        if (eventHandledSuccessfully)
+        //        {
+        //            RecordEventSuccess(e.EventType);
+        //        }
+        //    }
+        //    catch (Exception ex)
+        //    {
+        //        _logger.LogError(ex, $"异步处理事件失败: EventId={e.EventId}, EventType={e.EventType}");
+                
+        //        // 事件处理失败，记录失败（触发熔断计数）
+        //        RecordEventFailure(e.EventType);
+        //    }
+        //    finally
+        //    {
+        //        _eventSemaphore.Release();
+        //    }
+        //}
+
+        /// <summary>
+        /// 内部事件处理方法（Channel队列模式，无信号量限流）
+        /// </summary>
+        private async Task HandleEventInternalAsync(PlcEventTriggeredEventArgs e, bool flag)
         {
-            // 尝试获取信号量，最多等待100ms
-            if (!await _eventSemaphore.WaitAsync(TimeSpan.FromMilliseconds(100)))
+            // 检查断路器状态
+            if (!IsEventAllowed(e.EventType))
             {
-                _logger.LogWarning($"事件处理队列已满，丢弃事件: EventId={e.EventId}, EventType={e.EventType}");
+                var remainingTime = GetCircuitBreakerRemainingTime(e.EventType);
+                _logger.LogWarning($"事件[{e.EventType}]已熔断，拒绝处理，剩余熔断时间: {remainingTime}ms");
                 return;
             }
 
-            try
+            bool eventHandledSuccessfully = false;
+
+            if (!flag)   //mes离线处理事件
             {
-                // 检查断路器状态
-                if (!IsEventAllowed(e.EventType))
+                switch (e.EventType)
                 {
-                    var remainingTime = GetCircuitBreakerRemainingTime(e.EventType);
-                    _logger.LogWarning($"事件[{e.EventType}]已熔断，拒绝处理，剩余熔断时间: {remainingTime}ms");
-                    return;
+                    case "BatchCheckIn"://批次校验上升沿触发
+                    case "BatchCheckOut"://批次校验下降沿触发
+                        await HandleBatchCheckAsync(e, e.IsRisingEdge);
+                        eventHandledSuccessfully = true;
+                        break;
+                    case "MainCheckIn"://主条码进站校验上升沿触发
+                    case "MainCheckDownIn"://主条码进站校验下降沿触发
+                        await HandleMainCheckInAsync(e, e.IsRisingEdge);
+                        eventHandledSuccessfully = true;
+                        break;
+                    case "SubCheckIn"://子条码进站校验上升沿触发
+                    case "SubCheckDownIn"://子条码进站校验下降沿触发
+                        await HandleSubCheckAsync(e, e.IsRisingEdge);
+                        eventHandledSuccessfully = true;
+                        break;
+                    case "MainCheckOut"://采集加工数据上升沿触发
+                    case "MainCheckDownOut"://采集加工数据下降沿触发
+                        await HandleMainCheckOutAsync(e, e.IsRisingEdge);
+                        eventHandledSuccessfully = true;
+                        break;
+                    case "Processing"://表明工件已经入不可逆工艺 上升沿
+                    case "ProcessDowning"://表明工件已经入不可逆工艺 下降沿
+                        await HandleProcessingAsync(e, e.IsRisingEdge);
+                        eventHandledSuccessfully = true;
+                        break;
+                    //标定参数
+                    case "Calibra_Data":
+                    case "CalibraDown_Data":
+                        await HandleCalibraDataAsync(e,e.IsRisingEdge);
+                        eventHandledSuccessfully = true;
+                        break;
+                    //打印上升沿处理事件
+                    case "PrintExchange":
+                        await HandlePrintExchangeAsync(e);
+                        eventHandledSuccessfully = true;
+                        break;
+                    case "Bounce"://跳动上升沿触发
+                    case "BounceDown"://跳动下降沿触发
+                        await HandleBounceAsync(e,e.IsRisingEdge);
+                        eventHandledSuccessfully = true;
+                        break;
+                    default:
+                        _logger.LogWarning($"未知的事件类型: {e.EventType}");
+                        break;
                 }
-
-                bool eventHandledSuccessfully = false;
-
-                if (!flag)   //mes离线处理事件
+            }
+            else
+            {
+                switch (e.EventType)
                 {
-                    switch (e.EventType)
-                    {
-                        case "BatchCheckIn"://批次校验上升沿触发
-                        case "BatchCheckOut"://批次校验下降沿触发
-                            await HandleBatchCheckAsync(e, e.IsRisingEdge);
+                    //主条码进站校验，保存下发参数
+                    case "ParameterDistributionDown":
+                            await HandleParameterDistributionDownAsync(e);
                             eventHandledSuccessfully = true;
-                            break;
-                        case "MainCheckIn"://主条码进站校验上升沿触发
-                        case "MainCheckDownIn"://主条码进站校验下降沿触发
-                            await HandleMainCheckInAsync(e, e.IsRisingEdge);
-                            eventHandledSuccessfully = true;
-                            break;
-                        case "SubCheckIn"://子条码进站校验上升沿触发
-                        case "SubCheckDownIn"://子条码进站校验下降沿触发
-                            await HandleSubCheckAsync(e, e.IsRisingEdge);
-                            eventHandledSuccessfully = true;
-                            break;
-                        case "MainCheckOut"://采集加工数据上升沿触发
-                        case "MainCheckDownOut"://采集加工数据下降沿触发
-                            await HandleMainCheckOutAsync(e, e.IsRisingEdge);
-                            eventHandledSuccessfully = true;
-                            break;
-                        case "Processing"://表明工件已经入不可逆工艺 上升沿
-                        case "ProcessDowning"://表明工件已经入不可逆工艺 下降沿
-                            await HandleProcessingAsync(e, e.IsRisingEdge);
-                            eventHandledSuccessfully = true;
-                            break;
-                        //返修上线相关
-                        case "Repair":     //上升沿触发
-                            await HandleRepairUpAsync(e);
-                            eventHandledSuccessfully = true;
-                            break;
-                        //标定参数
-                        case "Calibra_Data":
-                            await HandleCalibraUpDataAsync(e);
-                            eventHandledSuccessfully = true;
-                            break;
-                        //打印上升沿处理事件
-                        case "PrintExchange":
-                            await HandlePrintExchangeAsync(e);
-                            eventHandledSuccessfully = true;
-                            break;
-                        case "Bounce"://跳动
-                            await HandleBounceExchangeAsync(e);
-                            eventHandledSuccessfully = true;
-                            break;
-                        default:
-                            _logger.LogWarning($"未知的事件类型: {e.EventType}");
-                            break;
-                    }
+                        break;
+                    case "Bounce"://跳动上升沿触发
+                    case "BounceDown"://跳动下降沿触发
+                        await HandleBounceAsync(e, e.IsRisingEdge);
+                        eventHandledSuccessfully = true;
+                        break;
+                    case "BitwiseAND"://位移压力
+                        break;
+                    case "ScrewDown"://拧紧
+                        break;  
                 }
-                else
-                {
-                    switch (e.EventType)
-                    {
-                        //参数下发下降沿
-                        case "ParameterDistributionDown":
-                                await HandleParameterDistributionDownAsync(e);
-                            break;
-                        case "Bounce"://跳动
-                            break;
-                        case "BitwiseAND"://位移压力
-                            break;
-                        case "":
-                            break;  
-
-                    }
-              }
-                
-
+            }
                 // 事件处理成功，记录成功
-                if (eventHandledSuccessfully)
-                {
-                    RecordEventSuccess(e.EventType);
-                }
-            }
-            catch (Exception ex)
+            if (eventHandledSuccessfully)
             {
-                _logger.LogError(ex, $"异步处理事件失败: EventId={e.EventId}, EventType={e.EventType}");
-                
-                // 事件处理失败，记录失败（触发熔断计数）
-                RecordEventFailure(e.EventType);
-            }
-            finally
-            {
-                _eventSemaphore.Release();
+                RecordEventSuccess(e.EventType);
             }
         }
 
@@ -1832,6 +1927,12 @@ namespace WinformDevFramework.Services.PLCBasic
                     case "string":
                         var stringResult = _plcCommunicationService.ReadString(plcCode, address, 256);
                         return stringResult.IsSuccess ? stringResult.Content : string.Empty;
+                    case "byte":
+                        var  byteResult= _plcCommunicationService.ReadByte(plcCode, address);
+                        return byteResult.IsSuccess ? byteResult.Content.ToString() : string.Empty;
+                    case "double":
+                        var doubleResult = _plcCommunicationService.ReadDouble(plcCode,address);
+                        return doubleResult.IsSuccess ? doubleResult.Content.ToString() : string.Empty;
                     default:
                         // 默认尝试读取int32
                         var defaultResult = _plcCommunicationService.ReadInt32(plcCode, address);
@@ -2082,16 +2183,20 @@ namespace WinformDevFramework.Services.PLCBasic
             {
                 _logger.LogInformation($"开始处理主条码验证事件: EventId={e.EventId}, PlcCode={e.PlcCode}, StationCode={e.StationCode}");
 
-                // 第一步：检查设备状态
-                int deviceStatus = CheckDeviceStatus(e.PlcCode, e.StationCode);
-                if (deviceStatus == -1)
+                // 第一步：获取事件数据点配置
+                if (!GetEventDataPoints(e.EventId, out var readDataPoints, out var writeDataPoints))
                 {
                     return;
                 }
-
-                // 第二步：获取事件数据点配置
-                if (!GetEventDataPoints(e.EventId, out var readDataPoints, out var writeDataPoints))
+                Dictionary<string, object> dataToWrite = new Dictionary<string, object>();
+                // 第二步：检查设备状态
+                int deviceStatus = CheckDeviceStatus(e.PlcCode, e.StationCode);
+                
+                if (deviceStatus == -1)
                 {
+                    string msg = "当前设备状态不为83，90，不满足生产条件";
+                    await ErrorMsg(e.PlcCode, e.StationCode, "", "", 103, writeDataPoints, dataToWrite);
+                    _logger.LogError(msg);
                     return;
                 }
 
@@ -2166,10 +2271,65 @@ namespace WinformDevFramework.Services.PLCBasic
                 //批次号码
                 string batchCheckId = CleanPlcString(readDataPointsDict.ContainsKey("BatchCheckID") ? readDataPointsDict["BatchCheckID"] : string.Empty);
                 //程序号
-                string RecipeVer = CleanPlcString(readDataPointsDict.ContainsKey("RecipeVer") ? readDataPointsDict["RecipeVer"] : string.Empty);
-                
+                string RecipeVer = CleanPlcString(readDataPointsDict.ContainsKey("RecipeVer") ? readDataPointsDict["RecipeVer"] : string.Empty);               
                 //返修标志
                 bool atRepair = readDataPointsDict.ContainsKey("AtRepair") ? bool.Parse(readDataPointsDict["AtRepair"]) : false;
+                //提前下发参数
+                bool preReleaseReq= readDataPointsDict.ContainsKey("preReleaseReq") ? bool.Parse(readDataPointsDict["preReleaseReq"]) : false;
+
+                if (preReleaseReq)
+                {
+                    if (string.IsNullOrWhiteSpace(RecipeVer) || RecipeVer=="0")
+                    {
+                        msg = $"提前下发参数触发，{stationCode}工站未传递程序号信息";
+                        LogReadValuesOnError(plcCode, stationCode, partId, msg, readDataPointsDict);
+                        await ErrorMsg(plcCode, stationCode, partId, msg, 103, writeDataPoints, dataToWrite);
+                        DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
+                        return;
+                    }
+                    //根据程序号和工站号获取参数下发配置
+                    var parameterDistribution = await _parameterDistributionRepository.QueryByClauseAsync(pd => pd.RecipeCode == RecipeVer);
+                    if (parameterDistribution == null)
+                    {
+                        msg = $"提前下发参数：未找到程序号{RecipeVer}的参数下发配置";
+                        LogReadValuesOnError(plcCode, stationCode, partId, msg, readDataPointsDict);
+                        await ErrorMsg(plcCode, stationCode, partId, msg, 5, writeDataPoints, dataToWrite);
+                        DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
+                        return;
+                    }
+                    var distributionDetails = await _parameterDistributionDetailRepository.QueryListByClauseAsync(o => o.DistributionID == parameterDistribution.ID && o.StationCode == stationCode);
+                    if (distributionDetails == null || !distributionDetails.Any())
+                    {
+                        msg = $"提前下发参数：未找到程序号{RecipeVer}工站{stationCode}的下发详情配置";
+                        LogReadValuesOnError(plcCode, stationCode, partId, msg, readDataPointsDict);
+                        await ErrorMsg(plcCode, stationCode, partId, msg, 5, writeDataPoints, dataToWrite);
+                        DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
+                        return;
+                    }
+                    // 下发参数到PLC
+                    foreach (var detail in distributionDetails)
+                    {
+                        if (!string.IsNullOrEmpty(detail.AddressCode) && !string.IsNullOrEmpty(detail.ParamValue))
+                        {
+                            try
+                            {
+                                WriteDataPoint(plcCode, detail.AddressCode, detail.DataType, detail.ParamValue);
+                                _logger.LogInformation($"提前下发参数: {detail.ParamName} = {detail.ParamValue} -> {detail.AddressCode}");
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger.LogWarning(ex, $"提前下发参数失败: {detail.ParamName} -> {detail.AddressCode}");
+                            }
+                        }
+                    }
+                    // 写入PLC响应
+                    dataToWrite.Add("PreReleaseReq", true);
+                    dataToWrite.Add("PartType", parameterDistribution.ProductModelCode);
+                    dataToWrite.Add("RecipeVer", RecipeVer);
+                    await CollectAndWriteDataPointsAsync(plcCode, writeDataPoints, dataToWrite);
+                    _logger.LogInformation($"提前下发参数完成: StationCode={stationCode}, RecipeVer={RecipeVer}, PartType={parameterDistribution.ProductModelCode}");
+                    return;
+                }
                 WipBarCode wipBarcode = new WipBarCode();
                 //执行返修操作
                 if (atRepair)
@@ -2178,31 +2338,24 @@ namespace WinformDevFramework.Services.PLCBasic
                     if(string.IsNullOrWhiteSpace(suPartId))
                     {
                         msg = $"返修标识触发，{stationCode}工站未传递子条码信息";
+                        LogReadValuesOnError(plcCode, stationCode, partId, msg, readDataPointsDict);
                         await ErrorMsg(plcCode, stationCode, suPartId, msg, 103, writeDataPoints, dataToWrite);
                         DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
                         return;
                     }
-                    //根据子条码获取主条码信息
-                    var material = await _wipMaterialInfoRepository.QueryByClauseAsync(o => o.MaterialCode == suPartId);
-                    if (material==null)
-                    {
-                        msg = $"未找到该零件信息: 子条码={suPartId}";
-                        await ErrorMsg(plcCode, stationCode, suPartId, msg, 103, writeDataPoints, dataToWrite);
-                        DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
-                        return;
-                    }
-                    wipBarcode = await _wipBarcodeRepository.QueryByClauseAsync(o => o.RFIDCode == material.RfidCode);
+                    //子条码实际是主产品条码，在OP05-1B工站更新得，流程一般是按照RFIDCode进行处理，
+                    wipBarcode = await _wipBarcodeRepository.QueryByClauseAsync(o => o.BarCode == suPartId);
                     if(wipBarcode == null)
                     {
                         msg = $"未找到主条码信息: 子条码={suPartId}";
+                        LogReadValuesOnError(plcCode, stationCode, partId, msg, readDataPointsDict);
                         await ErrorMsg(plcCode, stationCode, suPartId, msg, 103, writeDataPoints, dataToWrite);
                         DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
                         return;
                     }
                     //创建新RFID条码
-                    partId = await GenerateBarcode(stationCode,RecipeVer);
-                    partType = wipBarcode.ModelCode;
-                    RecipeVer = wipBarcode.RecipeCode;
+                    partId = await GenerateBarcode(stationCode, wipBarcode.RecipeCode);
+
                 }
                 int PartStatus=0;
                 bool isRecipeMatch = false;
@@ -2216,14 +2369,53 @@ namespace WinformDevFramework.Services.PLCBasic
                         if (parameterDistribution == null)
                         {
                             msg = $"OP05-1A工站程序号{RecipeVer}未获取到对应参数分配信息";
-                            _logger.LogInformation($"发布主零件进站校验失败: StationCode={stationCode}, Barcode={partId},失败原因{msg}");
+                            LogReadValuesOnError(plcCode, stationCode, partId, msg, readDataPointsDict);
+                            _logger.LogError($"发布主零件进站校验失败: StationCode={stationCode}, Barcode={partId},失败原因{msg}");
                             await ErrorMsg(plcCode, stationCode, partId, msg, 4, writeDataPoints, dataToWrite);
                             DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
                             return;
                         }
                         partType = parameterDistribution.ProductModelCode;
                         //重新生成RFID条码
-                        partId = await GenerateBarcode(stationCode, RecipeVer);
+                        if (string.IsNullOrWhiteSpace(partId)|| partId=="0")
+                        {
+                            partId = await GenerateBarcode(stationCode, RecipeVer);
+                        }
+                        else
+                        {
+                            // 传入RFID时，检查是否是复投情况
+                            wipBarcode = await _wipBarcodeRepository.QueryByClauseAsync(o => o.RFIDCode == partId);
+                            if (wipBarcode != null && wipBarcode.StationCode == stationCode && wipBarcode.BarCodeType == "2")
+                            {
+                                // 复投情况，直接返回OK
+                                dataToWrite.Add("PartType", partType);
+                                dataToWrite.Add("RecipeVer", RecipeVer);
+                                dataToWrite.Add("PartID", partId);
+                                dataToWrite.Add("PartOK", true);
+                                dataToWrite.Add("PartIDReqDone", true);
+                                msg = $"允许{partId}重新进站{stationCode}";
+                                await CollectAndWriteDataPointsAsync(plcCode, writeDataPoints, dataToWrite);
+                                _logger.LogInformation(msg);
+                                return;
+                            }
+                            // 非复投情况，检查WIP是否存在及下一工站是否匹配
+                            if (wipBarcode == null)
+                            {
+                                msg = $"{stationCode}工站{partId}条码没有在制信息";
+                                LogReadValuesOnError(plcCode, stationCode, partId, msg, readDataPointsDict);
+                                await ErrorMsg(plcCode, stationCode, partId, msg, 5, writeDataPoints, dataToWrite);
+                                DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
+                                return;
+                            }
+                            if (wipBarcode.NextStationCode != stationCode)
+                            {
+                                msg = $"当前站点{wipBarcode.NextStationCode}与目标站点{stationCode}不一致";
+                                LogReadValuesOnError(plcCode, stationCode, partId, msg, readDataPointsDict);
+                                await ErrorMsg(plcCode, stationCode, partId, msg, 6, writeDataPoints, dataToWrite);
+                                DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
+                                return;
+                            }
+                        }
 
                     }
                     else
@@ -2232,6 +2424,7 @@ namespace WinformDevFramework.Services.PLCBasic
                         if (string.IsNullOrWhiteSpace(RecipeVer))
                         {
                             msg = $"{stationCode}工站未传递程序版本号";
+                            LogReadValuesOnError(plcCode, stationCode, partId, msg, readDataPointsDict);
                             _logger.LogInformation($"发布主零件进站校验失败: StationCode={stationCode}, Barcode={partId},失败原因{msg}");
                             await ErrorMsg(plcCode, stationCode, partId, msg, 4, writeDataPoints, dataToWrite);
                             DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
@@ -2240,6 +2433,7 @@ namespace WinformDevFramework.Services.PLCBasic
                         if (string.IsNullOrWhiteSpace(partType))
                         {
                             msg = $"{stationCode}工站未传递型号信息";
+                            LogReadValuesOnError(plcCode, stationCode, partId, msg, readDataPointsDict);
                             await ErrorMsg(plcCode, stationCode, partId, msg, 4, writeDataPoints, dataToWrite);
                             DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
                             return;
@@ -2247,6 +2441,7 @@ namespace WinformDevFramework.Services.PLCBasic
                         if (string.IsNullOrEmpty(partId))
                         {
                             msg = $"{stationCode}工站未传递RFID条码信息";
+                            LogReadValuesOnError(plcCode, stationCode, partId, msg, readDataPointsDict);
                             await ErrorMsg(plcCode, stationCode, partId, msg, 4, writeDataPoints, dataToWrite);
                             DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
                             return;
@@ -2255,28 +2450,53 @@ namespace WinformDevFramework.Services.PLCBasic
                         if (wipBarcode == null)
                         {
                             msg = $"{stationCode}工站{partId}条码没有在制信息";
+                            LogReadValuesOnError(plcCode, stationCode, partId, msg, readDataPointsDict);
                             await ErrorMsg(plcCode, stationCode, partId, msg, 5, writeDataPoints, dataToWrite);
+                            DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
+                            return;
+                        }
+                        //重新进站的情况，直接返回OK的信号
+                        if(wipBarcode.StationCode==stationCode &&wipBarcode.BarCodeType=="2"){
+                            
+                            dataToWrite.Add("PartType", partType);
+                            dataToWrite.Add("RecipeVer", RecipeVer);
+                            dataToWrite.Add("PartID", partId);
+                            dataToWrite.Add("PartOK", true);
+                            dataToWrite.Add("PartIDReqDone", true);
+                            msg = $"允许{partId}重新进站{stationCode}";                           
+                            await CollectAndWriteDataPointsAsync(plcCode, writeDataPoints, dataToWrite);
+                            _logger.LogInformation(msg);
+                            return;
+                        }
+                        // 验证前一站是否已过站（BarCodeType=0表示已过站，1表示未过站）
+                        if (wipBarcode.BarCodeType != "0")
+                        {
+                            msg = $"前一站未过站（BarCodeType={wipBarcode.BarCodeType}），不允许进入{stationCode}工站";
+                            LogReadValuesOnError(plcCode, stationCode, partId, msg, readDataPointsDict);
+                            await ErrorMsg(plcCode, stationCode, partId, msg, 6, writeDataPoints, dataToWrite);
                             DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
                             return;
                         }
                         if (wipBarcode.NextStationCode != stationCode)
                         {
                             msg = $"当前站点{wipBarcode.NextStationCode}与目标站点{stationCode}不一致";
+                            LogReadValuesOnError(plcCode, stationCode, partId, msg, readDataPointsDict);
                             await ErrorMsg(plcCode, stationCode, partId, msg, 6, writeDataPoints, dataToWrite);
                             DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
                             return;
                         }
                     }
-                    //不可逆信息
-                    var process = await _wipBarCodeProcessRepository.QueryByClauseAsync(o => o.RfidCode == partId && o.StationCode == stationCode);
-                    if (process != null)
-                    {
-                        msg = $"该条码{partId}在工站{stationCode}有不可逆信息";
-                        await ErrorMsg(plcCode, stationCode, partId, msg, 6, writeDataPoints, dataToWrite);
-                        DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
-                        return;
-                    }
-                }              
+                }
+                //不可逆信息（正常进站和返修都需要检查）
+                var process = await _wipBarCodeProcessRepository.QueryByClauseAsync(o => o.RfidCode == partId && o.StationCode == stationCode);
+                if (process != null)
+                {
+                    msg = $"该条码{partId}在工站{stationCode}有不可逆信息";
+                    LogReadValuesOnError(plcCode, stationCode, partId, msg, readDataPointsDict);
+                    await ErrorMsg(plcCode, stationCode, partId, msg, 6, writeDataPoints, dataToWrite);
+                    DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
+                    return;
+                }
                 stationRecipeCurrent = await _stationRecipeCurrentRepository.QueryByClauseAsync(sr => sr.PlcCode == plcCode && sr.StationCode == stationCode);
                 if (stationRecipeCurrent == null)
                 {
@@ -2292,26 +2512,25 @@ namespace WinformDevFramework.Services.PLCBasic
                     else
                     {
                         isRecipeMatch = string.Equals(RecipeVer, wipBarcode.RecipeCode, StringComparison.OrdinalIgnoreCase);
-
                     }
                 }
                 if (isRecipeMatch)
                 {
                     _logger.LogInformation($"参数版本一致: RecipeVer={RecipeVer}, 当前Recipe={stationRecipeCurrent.RecipeCode}");
-                    dataToWrite.Add("PartOK", true);
                     dataToWrite.Add("RecipeDone", false);
                 }
                 else
                 {
                     //进行参数下发
-                    // 参数版本不一致，需要下发新参数
-                   string mbRecipeVer= stationCode == "OP05-1A" ? RecipeVer : wipBarcode.RecipeCode;
+                    // 返修场景：程序号统一来源于WIP表
+                    string mbRecipeVer = atRepair ? wipBarcode.RecipeCode : (stationCode == "OP05-1A" ? RecipeVer : wipBarcode.RecipeCode);
                     _logger.LogInformation($"参数版本不一致，开始下发新参数: 当前RecipeVer={RecipeVer}, 目标Recipe={mbRecipeVer}");
                     // 3.1 拿RecipeVer值匹配PLC_ParameterDistribution的RecipeCode
                     var parameterDistribution = await _parameterDistributionRepository.QueryByClauseAsync(pd => pd.RecipeCode == mbRecipeVer);
                     if(parameterDistribution==null)
                     {
                         msg = $"未找到参数下发配置: RecipeCode={mbRecipeVer}";
+                        LogReadValuesOnError(plcCode, stationCode, partId, msg, readDataPointsDict);
                         await ErrorMsg(plcCode, stationCode, partId, msg,5, writeDataPoints, dataToWrite);
                         DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
                         return;
@@ -2320,6 +2539,7 @@ namespace WinformDevFramework.Services.PLCBasic
                     if (distributionDetails == null)
                     {
                         msg = $"未找到程序号{mbRecipeVer}该工站{stationCode}的下发详情配置信息";
+                        LogReadValuesOnError(plcCode, stationCode, partId, msg, readDataPointsDict);
                         await ErrorMsg(plcCode, stationCode, partId, msg, 5,writeDataPoints, dataToWrite);
                         DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
                         return;
@@ -2498,6 +2718,7 @@ namespace WinformDevFramework.Services.PLCBasic
                     msg="参数下发完成";
                     // 发布PLC参数下发事件（下发完成）
                     DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
+                    dataToWrite.Add("RecipeDone", true);
                 }
                 //成功才写入的数据
 
@@ -2511,7 +2732,7 @@ namespace WinformDevFramework.Services.PLCBasic
                     dataToWrite.Add("PartType", wipBarcode.ModelCode);
                     dataToWrite.Add("RecipeVer", wipBarcode.RecipeCode);
                 }
-
+                dataToWrite.Add("PartOK", true);
                 dataToWrite.Add("PartID", partId);
                 dataToWrite.Add("PartStatus", PartStatus);
                 DateTime today = DateTime.Today;
@@ -2530,6 +2751,7 @@ namespace WinformDevFramework.Services.PLCBasic
                 }
                 stationProcessInfo = _stationProcessCache[$"{plcCode}_{stationCode}"];
                 // PLC 操作完成后，异步更新或新增 WipBarCode 表数据
+                
                 if (!atRepair)
                 {
                     await UpdateWipBarcodeAsync(partId, partType, stationCode, batchCheckId, stationProcessInfo,RecipeVer);
@@ -2555,12 +2777,12 @@ namespace WinformDevFramework.Services.PLCBasic
                             await _wipMaterialInfoRepository.UpdateAsync(materialList);
                             _logger.LogInformation($"返修-批量更新子零件关联主条码: Count={materialList.Count}, OldBarCode={oldBarCode}, NewBarCode={partId}");
                         }
-
-                        // 3. 更新主条码表的 Barcode 字段为新条码 partId
+                        // 3. 更新主条码表的 RFIDCode 字段为新条码 partId
                         wipBarcode.RFIDCode = partId;
                         wipBarcode.InputTime = DateTime.Now;
                         wipBarcode.OutputTime = null;
                         wipBarcode.StationCode = stationCode;
+                        wipBarcode.NextStationCode = GetNextStationCode(stationCode,stationProcessInfo);
                         wipBarcode.PrStationCode = wipBarcode.StationCode;
                         wipBarcode.RepairCount = (wipBarcode.RepairCount ?? 0) + 1;
                         wipBarcode.UpdateUser = "system";
@@ -2588,7 +2810,7 @@ namespace WinformDevFramework.Services.PLCBasic
         {
             //直接返回错误
             dataToWrite.Add("PartNG", true);
-            dataToWrite.Add("PartIDReqDone", true);
+            dataToWrite.Add("PartIDReqDone", false);
             // 主条码进站失败错误代码：3，错误信息：msg
             dataToWrite.Add("MainCheckInErrorCode", MainCheckInErrorCode);
             //dataToWrite.Add("MainCheckInErrorMsg", msg);
@@ -2619,7 +2841,8 @@ namespace WinformDevFramework.Services.PLCBasic
                     { "PartOK", false },
                     { "PartNG", false },
                     { "RecipeDone", false },
-                    { "MainCheckInErrorCode",0}
+                    { "MainCheckInErrorCode",0},
+                    { "PreReleaseReq",false}
                 };
 
                 // 写入PLC（使用重试机制）
@@ -2762,6 +2985,7 @@ namespace WinformDevFramework.Services.PLCBasic
                     msg = $"子条码、主条码或型号为空，无法继续处理";
                     await SuCheckErrorMsg(plcCode, stationCode, partId, subpartId,msg, 101, writeDataPoints, dataToWrite);
                     DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
+                    _logger.LogError(msg);
                     return;
 
                 }
@@ -2772,6 +2996,7 @@ namespace WinformDevFramework.Services.PLCBasic
                     msg = $"采集型号 [{partType}] 与当前生产型号 [{stationProcessInfo.ProductModel}] 不一致";
                     await SuCheckErrorMsg(plcCode, stationCode, partId, subpartId, msg, 101, writeDataPoints, dataToWrite);
                     DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
+                    _logger.LogError(msg);
                     return;
                 }
                 var wipBarcode = await _wipBarcodeRepository.QueryByClauseAsync(o => o.RFIDCode == partId && o.StationCode == stationCode);
@@ -2780,6 +3005,7 @@ namespace WinformDevFramework.Services.PLCBasic
                     msg = $"未找到RFID条码 {partId} 对应的在制品信息";
                     await SuCheckErrorMsg(plcCode, stationCode, partId, subpartId, msg, 101, writeDataPoints, dataToWrite);
                     DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
+                    _logger.LogError(msg);
                     return;
                 }
                 // 从型号获取工艺路线
@@ -2794,10 +3020,6 @@ namespace WinformDevFramework.Services.PLCBasic
                          requiredPartCount++;
                      if (productModelInfo.IsScanThird.HasValue && productModelInfo.IsScanThird.Value)
                          requiredPartCount++;
-                    if (productModelInfo.IsScanBatch.HasValue && productModelInfo.IsScanBatch.Value)
-                    {
-                        requiredPartCount++;
-                    }
                     _logger.LogInformation($"当前工站 {stationCode} 需要扫描 {requiredPartCount} 个子零件");
                  }
                  else
@@ -2805,6 +3027,7 @@ namespace WinformDevFramework.Services.PLCBasic
                      msg = $"未找到型号{partType}对应工站{stationCode}的工艺路线配置";
                     await SuCheckErrorMsg(plcCode, stationCode, partId, subpartId, msg, 101, writeDataPoints, dataToWrite);
                     DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
+                    _logger.LogError(msg);
                     return;
                  }              
                 // 验证子零件是否已存在（避免重复扫描）
@@ -2817,6 +3040,19 @@ namespace WinformDevFramework.Services.PLCBasic
                         msg = $"WipMaterialInfo 已存在该条码 {partId} 和工站 {stationCode} 对应的子零件 {subpartId}";
                         await SuCheckErrorMsg(plcCode, stationCode, partId, subpartId, msg, 101, writeDataPoints, dataToWrite);
                         DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
+                        _logger.LogError(msg);
+                        return;
+                    }
+                }
+                if (stationCode == "OP30")
+                {
+                    var wipProcess=await _wipProcessDataRepository.QueryByClauseAsync(O => O.BarCode == subpartId &&O.CurveTypes=="位压");
+                    if (wipProcess == null) 
+                    {
+                        msg = $"wipProcess 不存在该条码 {subpartId} 的位压曲线";
+                        await SuCheckErrorMsg(plcCode, stationCode, partId, subpartId, msg, 101, writeDataPoints, dataToWrite);
+                        DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
+                        _logger.LogError(msg);
                         return;
                     }
                 }
@@ -2837,6 +3073,7 @@ namespace WinformDevFramework.Services.PLCBasic
                     msg = validationResult.errorMsg;
                     await SuCheckErrorMsg(plcCode, stationCode, partId, subpartId, msg, 101, writeDataPoints, dataToWrite);
                     DataPushBus.PublishMainPartStationCheck(stationCode, partId, false, msg);
+                    _logger.LogError(msg);
                     return;
                 }                
                 // 计算当前子零件序号
@@ -3354,6 +3591,9 @@ namespace WinformDevFramework.Services.PLCBasic
         {
             try
             {
+
+                List<string> listscrewdown = new List<string>() { "OP05-2","OP30-1","OP30-2" };
+
                 // 质量采集数据（清理PLC字符串中的特殊字符）
                 string productModel = CleanPlcString(readQualityDataPointsDict.TryGetValue("PartType", out string pt) ? pt : string.Empty);
                 string RFIDCode = CleanPlcString(readQualityDataPointsDict.TryGetValue("PartID", out string pid) ? pid : string.Empty);
@@ -3363,78 +3603,6 @@ namespace WinformDevFramework.Services.PLCBasic
                 int PartResult = readQualityDataPointsDict.TryGetValue("PartResult", out string prStr) && int.TryParse(prStr, out int pr) ? pr : 0;
                 string RecipeVer = CleanPlcString(readQualityDataPointsDict.TryGetValue("RecipeVer", out string rv) ? rv : string.Empty);
                 int testCode = readQualityDataPointsDict.TryGetValue("TestCode", out string tcStr) && int.TryParse(tcStr, out int tc) ? tc : 0;
-
-                string LineID = CleanPlcString(readResultDataPointsDict.TryGetValue("LineID", out string li) ? li : string.Empty);
-                string StationId = CleanPlcString(readResultDataPointsDict.TryGetValue("StationID", out string si) ? si : string.Empty);
-                int PalletNo = readResultDataPointsDict.TryGetValue("PalletNo", out string po) && int.TryParse(po, out int por) ? por : 0;
-                int PalletType = readResultDataPointsDict.TryGetValue("PalletType", out string strpty)&&int.TryParse(strpty,out int pty) ? pty : 0;
-                int PalletStatus = readResultDataPointsDict.TryGetValue("PalletStatus", out string strps) && int.TryParse(strps, out int ps) ? ps : 0;
-
-                // 读取子零件结果数据 (P-Data[1] ~ P-Data[8])
-                // P-Data[1]
-                int SubResult1 = readResultDataPointsDict.TryGetValue("SubResult1", out string sd1) && int.TryParse(sd1, out int sdr1) ? sdr1 : 0;
-                double SubUSL1 = readResultDataPointsDict.TryGetValue("SubUSL1", out string su1) && double.TryParse(su1, out double sur1) ? sur1 : 0;
-                double SubResultValue1 = readResultDataPointsDict.TryGetValue("SubResultValue1", out string srv1) && double.TryParse(srv1, out double srvr1) ? srvr1 : 0;
-                double SubLSL1 = readResultDataPointsDict.TryGetValue("SubLSL1", out string sl1) && double.TryParse(sl1, out double slr1) ? slr1 : 0;
-
-                // P-Data[2]
-                int SubResult2 = readResultDataPointsDict.TryGetValue("SubResult2", out string sd2) && int.TryParse(sd2, out int sdr2) ? sdr2 : 0;
-                double SubUSL2 = readResultDataPointsDict.TryGetValue("SubUSL2", out string su2) && double.TryParse(su2, out double sur2) ? sur2 : 0;
-                double SubResultValue2 = readResultDataPointsDict.TryGetValue("SubResultValue2", out string srv2) && double.TryParse(srv2, out double srvr2) ? srvr2 : 0;
-                double SubLSL2 = readResultDataPointsDict.TryGetValue("SubLSL2", out string sl2) && double.TryParse(sl2, out double slr2) ? slr2 : 0;
-
-                // P-Data[3]
-                int SubResult3 = readResultDataPointsDict.TryGetValue("SubResult3", out string sd3) && int.TryParse(sd3, out int sdr3) ? sdr3 : 0;
-                double SubUSL3 = readResultDataPointsDict.TryGetValue("SubUSL3", out string su3) && double.TryParse(su3, out double sur3) ? sur3 : 0;
-                double SubResultValue3 = readResultDataPointsDict.TryGetValue("SubResultValue3", out string srv3) && double.TryParse(srv3, out double srvr3) ? srvr3 : 0;
-                double SubLSL3 = readResultDataPointsDict.TryGetValue("SubLSL3", out string sl3) && double.TryParse(sl3, out double slr3) ? slr3 : 0;
-
-                // P-Data[4]
-                int SubResult4 = readResultDataPointsDict.TryGetValue("SubResult4", out string sd4) && int.TryParse(sd4, out int sdr4) ? sdr4 : 0;
-                double SubUSL4 = readResultDataPointsDict.TryGetValue("SubUSL4", out string su4) && double.TryParse(su4, out double sur4) ? sur4 : 0;
-                double SubResultValue4 = readResultDataPointsDict.TryGetValue("SubResultValue4", out string srv4) && double.TryParse(srv4, out double srvr4) ? srvr4 : 0;
-                double SubLSL4 = readResultDataPointsDict.TryGetValue("SubLSL4", out string sl4) && double.TryParse(sl4, out double slr4) ? slr4 : 0;
-
-                // P-Data[5]
-                int SubResult5 = readResultDataPointsDict.TryGetValue("SubResult5", out string sd5) && int.TryParse(sd5, out int sdr5) ? sdr5 : 0;
-                double SubUSL5 = readResultDataPointsDict.TryGetValue("SubUSL5", out string su5) && double.TryParse(su5, out double sur5) ? sur5 : 0;
-                double SubResultValue5 = readResultDataPointsDict.TryGetValue("SubResultValue5", out string srv5) && double.TryParse(srv5, out double srvr5) ? srvr5 : 0;
-                double SubLSL5 = readResultDataPointsDict.TryGetValue("SubLSL5", out string sl5) && double.TryParse(sl5, out double slr5) ? slr5 : 0;
-
-                // P-Data[6]
-                int SubResult6 = readResultDataPointsDict.TryGetValue("SubResult6", out string sd6) && int.TryParse(sd6, out int sdr6) ? sdr6 : 0;
-                double SubUSL6 = readResultDataPointsDict.TryGetValue("SubUSL6", out string su6) && double.TryParse(su6, out double sur6) ? sur6 : 0;
-                double SubResultValue6 = readResultDataPointsDict.TryGetValue("SubResultValue6", out string srv6) && double.TryParse(srv6, out double srvr6) ? srvr6 : 0;
-                double SubLSL6 = readResultDataPointsDict.TryGetValue("SubLSL6", out string sl6) && double.TryParse(sl6, out double slr6) ? slr6 : 0;
-
-                // P-Data[7]
-                int SubResult7 = readResultDataPointsDict.TryGetValue("SubResult7", out string sd7) && int.TryParse(sd7, out int sdr7) ? sdr7 : 0;
-                double SubUSL7 = readResultDataPointsDict.TryGetValue("SubUSL7", out string su7) && double.TryParse(su7, out double sur7) ? sur7 : 0;
-                double SubResultValue7 = readResultDataPointsDict.TryGetValue("SubResultValue7", out string srv7) && double.TryParse(srv7, out double srvr7) ? srvr7 : 0;
-                double SubLSL7 = readResultDataPointsDict.TryGetValue("SubLSL7", out string sl7) && double.TryParse(sl7, out double slr7) ? slr7 : 0;
-
-                // P-Data[8]
-                int SubResult8 = readResultDataPointsDict.TryGetValue("SubResult8", out string sd8) && int.TryParse(sd8, out int sdr8) ? sdr8 : 0;
-                double SubUSL8 = readResultDataPointsDict.TryGetValue("SubUSL8", out string su8) && double.TryParse(su8, out double sur8) ? sur8 : 0;
-                double SubResultValue8 = readResultDataPointsDict.TryGetValue("SubResultValue8", out string srv8) && double.TryParse(srv8, out double srvr8) ? srvr8 : 0;
-                double SubLSL8 = readResultDataPointsDict.TryGetValue("SubLSL8", out string sl8) && double.TryParse(sl8, out double slr8) ? slr8 : 0;
-
-                // 读取工步节拍时间 (P-CT_Sub[1] ~ P-CT_Sub[7])
-                double CT_Sub1 = readResultDataPointsDict.TryGetValue("CT_Sub1", out string ct1) && double.TryParse(ct1, out double ctr1) ? ctr1 : 0;
-                double CT_Sub2 = readResultDataPointsDict.TryGetValue("CT_Sub2", out string ct2) && double.TryParse(ct2, out double ctr2) ? ctr2 : 0;
-                double CT_Sub3 = readResultDataPointsDict.TryGetValue("CT_Sub3", out string ct3) && double.TryParse(ct3, out double ctr3) ? ctr3 : 0;
-                double CT_Sub4 = readResultDataPointsDict.TryGetValue("CT_Sub4", out string ct4) && double.TryParse(ct4, out double ctr4) ? ctr4 : 0;
-                double CT_Sub5 = readResultDataPointsDict.TryGetValue("CT_Sub5", out string ct5) && double.TryParse(ct5, out double ctr5) ? ctr5 : 0;
-                double CT_Sub6 = readResultDataPointsDict.TryGetValue("CT_Sub6", out string ct6) && double.TryParse(ct6, out double ctr6) ? ctr6 : 0;
-                double CT_Sub7 = readResultDataPointsDict.TryGetValue("CT_Sub7", out string ct7) && double.TryParse(ct7, out double ctr7) ? ctr7 : 0;
-
-                // 总循环时间
-                double CT_Total = readResultDataPointsDict.TryGetValue("CT_Total", out string ctt) && double.TryParse(ctt, out double cttr) ? cttr : 0;
-
-
-
-
-
 
                 StationProcessInfo stationProcessInfo = GetStationRecipeCurrent(plcCode, stationCode);
                 WipProcessingIrreversible wipProcessingIrreversible = null;
@@ -3446,6 +3614,7 @@ namespace WinformDevFramework.Services.PLCBasic
                 if (string.IsNullOrWhiteSpace(RFIDCode))
                 {
                     errorMsg = "RFID主条码为空";
+                    LogReadValuesOnError(plcCode, stationCode, RFIDCode, errorMsg, readQualityDataPointsDict);
                     await WriteErrorStatusToPlc(plcCode, writeDataPoints, 2, errorMsg);
                     DataPushBus.PublishMainPartStationCheck(stationCode, RFIDCode, false, errorMsg);
                     return;
@@ -3467,15 +3636,17 @@ namespace WinformDevFramework.Services.PLCBasic
                 if(wipBarcode == null)
                 {
                     errorMsg = $"未找到RFID条码 {RFIDCode} 对应的在制品信息";
+                    LogReadValuesOnError(plcCode, stationCode, RFIDCode, errorMsg, readQualityDataPointsDict, readResultDataPointsDict);
                     await WriteErrorStatusToPlc(plcCode, writeDataPoints, 101, errorMsg);
                     DataPushBus.PublishMainPartStationCheck(stationCode, RFIDCode, false, errorMsg);
                     _logger.LogError(errorMsg);
                     return;
                 }
                 // 验证采集的型号与工站当前生产型号是否一致
-                if (!string.IsNullOrWhiteSpace(productModel))
+                if (string.IsNullOrWhiteSpace(productModel))
                 { 
                     errorMsg = $"未上传型号信息";
+                    LogReadValuesOnError(plcCode, stationCode, RFIDCode, errorMsg, readQualityDataPointsDict, readResultDataPointsDict);
                     await WriteErrorStatusToPlc(plcCode, writeDataPoints, 101, errorMsg);
                     DataPushBus.PublishMainPartStationCheck(stationCode, RFIDCode, false, errorMsg);
                     _logger.LogError(errorMsg);
@@ -3486,12 +3657,41 @@ namespace WinformDevFramework.Services.PLCBasic
                     if (!string.Equals(productModel, stationProcessInfo.ProductModel, StringComparison.OrdinalIgnoreCase))
                     {
                         errorMsg = $"采集型号 [{productModel}] 与工站当前生产型号 [{stationProcessInfo.ProductModel}] 不一致";
+                        LogReadValuesOnError(plcCode, stationCode, RFIDCode, errorMsg, readQualityDataPointsDict, readResultDataPointsDict);
                         await WriteErrorStatusToPlc(plcCode, writeDataPoints, 101, errorMsg);
                         DataPushBus.PublishMainPartStationCheck(stationCode, RFIDCode, false, errorMsg);
                         _logger.LogError(errorMsg);
                         return;
                     }
-                }               
+                }
+                if (listscrewdown.Contains(stationCode))
+                {
+                    //WipProcessData主表
+                    var processData = await _wipProcessDataRepository.QueryByClauseAsync(o => o.BarCode == RFIDCode && o.StationCode == stationCode&&o.CurveTypes=="拧紧");
+                    if (processData == null)
+                    {
+                        errorMsg = $"托盘条码{RFIDCode}没有拧紧数据";
+                        LogReadValuesOnError(plcCode, stationCode, RFIDCode, errorMsg, readQualityDataPointsDict, readResultDataPointsDict);
+                        await WriteErrorStatusToPlc(plcCode, writeDataPoints, 101, errorMsg);
+                        DataPushBus.PublishMainPartStationCheck(stationCode, RFIDCode, false, errorMsg);
+                        _logger.LogError(errorMsg);
+                        return;
+                    }
+                }
+                if ("OP10" == stationCode)
+                {
+                    //WipProcessData主表
+                    var processData = await _wipProcessDataRepository.QueryByClauseAsync(o => o.BarCode == RFIDCode && o.StationCode == stationCode && o.CurveTypes == "跳动");
+                    if (processData == null)
+                    {
+                        errorMsg = $"托盘条码{RFIDCode}在{stationCode}工站没有跳动数据";
+                        LogReadValuesOnError(plcCode, stationCode, RFIDCode, errorMsg, readQualityDataPointsDict, readResultDataPointsDict);
+                        await WriteErrorStatusToPlc(plcCode, writeDataPoints, 101, errorMsg);
+                        DataPushBus.PublishMainPartStationCheck(stationCode, RFIDCode, false, errorMsg);
+                        _logger.LogError(errorMsg);
+                        return;
+                    }
+                }
                 // 获取该工站需要的零件数量
                 int requiredPartCount = 0;
                 requiredPartCount = GetRequiredPartCount(stationCode, stationProcessInfo);
@@ -3515,6 +3715,7 @@ namespace WinformDevFramework.Services.PLCBasic
                 if (collectedSubParts.Count < requiredPartCount)
                 {
                     errorMsg = $"零件数量不足，期望 {requiredPartCount} 个，实际 {collectedSubParts.Count} 个";
+                    LogReadValuesOnError(plcCode, stationCode, RFIDCode, errorMsg, readQualityDataPointsDict, readResultDataPointsDict);
                     await WriteErrorStatusToPlc(plcCode, writeDataPoints, 2, errorMsg);
                     DataPushBus.PublishMainPartStationCheck(stationCode, RFIDCode, false, errorMsg);
                     _logger.LogWarning(errorMsg);
@@ -3533,15 +3734,15 @@ namespace WinformDevFramework.Services.PLCBasic
                         if (!subPartCodes.Contains(subPart))
                         {
                             errorMsg = $"采集的零件 {subPart} 与系统记录不匹配";
+                            LogReadValuesOnError(plcCode, stationCode, RFIDCode, errorMsg, readQualityDataPointsDict, readResultDataPointsDict);
                             await WriteErrorStatusToPlc(plcCode, writeDataPoints, 2, errorMsg);
                             DataPushBus.PublishMainPartStationCheck(stationCode, RFIDCode, false, errorMsg);
                             return;
                         }
                     }
-                }
-               
+                }               
                 //采集收集参数
-                List<PLC_TriggerParam> plcTriggerParams = await _plcTriggerParamRepository.QueryListByClauseAsync(o => o.StationCode == stationCode);
+                List<PLC_TriggerParam> plcTriggerParams = await _plcTriggerParamRepository.QueryListByClauseAsync(o => o.StationCode == stationCode &&(o.TreatmentType =="MSA" ||o.TreatmentType== "collect"));
                 
                 // 从PLC读取参数值并保存到字典
                 var collectedParams = new Dictionary<string, string>();
@@ -3551,11 +3752,9 @@ namespace WinformDevFramework.Services.PLCBasic
                     {
                         var paramValue = await ReadPlcParamAsync(plcCode, param.AddressCode, param.DataType);
                         collectedParams[param.ParamName] = paramValue;
-                        _logger.LogDebug($"采集参数成功: ParamName={param.ParamName}, AddressCode={param.AddressCode}, Value={paramValue}");
                     }
                     catch (Exception ex)
                     {
-                        _logger.LogError(ex, $"采集参数失败: ParamName={param.ParamName}, AddressCode={param.AddressCode}");
                         collectedParams[param.ParamName] = $"Error: {ex.Message}";
                     }
                 }
@@ -3573,7 +3772,7 @@ namespace WinformDevFramework.Services.PLCBasic
                 var insertId = await _plcCollectParametersRepository.InsertAsync(collectRecord);
                 collectRecord.ParamID = insertId;
 
-                // 保存到PLC_CollectParametersDetail详情表
+                // 保存到PLC_CollectParametersDetail详情表（批量插入）
                 var detailList = collectedParams.Select(kv => new PLC_CollectParametersDetail
                 {
                     ParamID = collectRecord.ParamID,
@@ -3581,12 +3780,10 @@ namespace WinformDevFramework.Services.PLCBasic
                     ParamValue = kv.Value
                 }).ToList();
 
-                foreach (var detail in detailList)
+                if (detailList.Count > 0)
                 {
-                    await _plcCollectParametersDetailRepository.InsertAsync(detail);
+                    await _plcCollectParametersDetailRepository.InsertAsync(detailList);
                 }
-
-                _logger.LogInformation($"参数采集保存成功: RFIDCode={RFIDCode}, StationCode={stationCode}, 参数数量={collectedParams.Count}");
 
                 // 通过DataPushBus发布参数采集结果到前端
                 DataPushBus.PublishParamUpdated(stationCode, plcCode, collectedParams);
@@ -3594,7 +3791,6 @@ namespace WinformDevFramework.Services.PLCBasic
                 dataToWrite["DataSaveDone"] = true;
                 dataToWrite["DataSaveOK"] = true;
                 dataToWrite["PartResult"] = 1;
-                 _logger.LogInformation($"主条码过站验证通过: RFIDCode={RFIDCode}");
                 // 验证通过
                 // 保存过站记录到WipBarCodeProcess表 结果数据
                 var processRecord = new WipBarCodeProcess
@@ -3613,45 +3809,8 @@ namespace WinformDevFramework.Services.PLCBasic
                     CreateUser = "System"
                 };
                 await _wipBarCodeProcessRepository.InsertAsync(processRecord);
-
-                var processResultData = new ProcessResultData
-                {
-                    BarCode = wipBarcode.BarCode,
-                    RfidBarcode = RFIDCode,
-                    CT_Sub1 = CT_Sub1,
-                    CT_Sub2 = CT_Sub2,
-                    CT_Sub3 = CT_Sub3,
-                    CT_Sub4 = CT_Sub4,
-                    CT_Sub5 = CT_Sub5,
-                    CT_Sub6 = CT_Sub6,
-                    CT_Sub7 = CT_Sub7,
-                    CT_Total = CT_Total,
-                    LineID = LineID,
-                    PalletNo = PalletNo,
-                    PalletStatus = PalletStatus,
-                    PalletType = PalletType,
-                    StationID = stationCode,
-                    SubLSL1 = SubLSL1,
-                    SubLSL2 = SubLSL2,
-                    SubLSL3 = SubLSL3,
-                    SubLSL4 = SubLSL4,
-                    SubLSL5 = SubLSL5,
-                    SubLSL6 = SubLSL6,
-                    SubLSL7 = SubLSL7,
-                    SubLSL8 = SubLSL8,
-                    SubResultValue1 = SubResultValue1,
-                    SubResultValue2 = SubResultValue2,
-                    SubResultValue3 = SubResultValue3,
-                    SubResultValue4 = SubResultValue4,
-                    SubResultValue5 = SubResultValue5,
-                    SubResultValue6 = SubResultValue6,
-                    SubResultValue7 = SubResultValue7,
-                    SubResultValue8 = SubResultValue8,
-                    ColletTime=DateTime.Now
-                };
-                await _processResultDataRepository.InsertAsync(processResultData);
-                // 更新WipBarCode表
-                await UpdateWipBarCodeStatus(RFIDCode, stationCode);
+                // 更新WipBarCode表（PartResult=0未作时BarCodeType=1，否则=0已过站）
+                await UpdateWipBarCodeStatus(RFIDCode, stationCode, PartResult);
                 await WriteDataPointsToPlc(plcCode, writeDataPoints, dataToWrite);
 
                 // 写入PLC响应
@@ -3686,66 +3845,31 @@ namespace WinformDevFramework.Services.PLCBasic
 
         #endregion
 
-        #region  返修相关事件
+        #region  标定相关事件
 
-        private async Task HandleRepairUpAsync(PlcEventTriggeredEventArgs e)
+        /// <summary>
+        /// 标定数据采集（合并上升沿/下降沿）
+        /// </summary>
+        /// <param name="e"></param>
+        /// <param name="isRisingEdge">true=上升沿，false=下降沿</param>
+        /// <returns></returns>
+        private async Task HandleCalibraDataAsync(PlcEventTriggeredEventArgs e, bool isRisingEdge)
         {
-            try
+            if (isRisingEdge)
             {
-                _logger.LogInformation($"开始处理加工返修上线事件: EventId={e.EventId}, PlcCode={e.PlcCode}, StationCode={e.StationCode}");
-
-                // 第一步：检查设备状态
-                int deviceStatus = CheckDeviceStatus(e.PlcCode, e.StationCode);
-                if (deviceStatus == -1)
-                {
-                    return;
-                }
-
-                // 第二步：获取事件数据点配置
-                if (!GetEventDataPoints(e.EventId, out var readDataPoints, out var writeDataPoints))
-                {
-                    return;
-                }
-
-                // 第三步：异步读取数据点
-                Dictionary<string, string> readDataPointsDict = await ReadEventDataPointsAsync(e.PlcCode, readDataPoints);
-
-                // 第四步：复位ProcessingDone标志
-                await HandleRepairUpEvent(e.PlcCode, e.StationCode, writeDataPoints, readDataPointsDict);
-
-                _logger.LogInformation($"返修上线事件处理完成: EventId={e.EventId}");
+                await HandleCalibraUpDataAsync(e);
             }
-            catch (Exception ex)
+            else
             {
-                _logger.LogError(ex, $"处理返修上线事件时发生错误: EventId={e.EventId}");
+                await HandleCalibraDownDataAsync(e);
             }
         }
 
         /// <summary>
-        /// 处理返工上线上升沿事件
-        /// </summary>  
-        private async Task HandleRepairUpEvent(string plcCode, string stationCode, List<PLC_Event_Data_Detail> writeDataPoints, Dictionary<string, string> readDataPointsDict)
-        {
-            try
-            {
-                // 复位ProcessingDone标志
-                Dictionary<string, object> dataToWrite = new Dictionary<string, object>
-                {
-                    { "ProcessingDone", false }
-                };
-
-                await WriteDataPointsToPlc(plcCode, writeDataPoints, dataToWrite);
-                _logger.LogInformation($"已向PLC下发ProcessingDone=false");
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "处理不可逆加工下降沿事件时发生错误");
-            }
-        }
-
-        #endregion
-      
-        #region  标定相关事件
+        /// 标定数据上升沿处理逻辑
+        /// </summary>
+        /// <param name="e"></param>
+        /// <returns></returns>
         private async Task HandleCalibraUpDataAsync(PlcEventTriggeredEventArgs e)
         {
             try
@@ -3777,11 +3901,7 @@ namespace WinformDevFramework.Services.PLCBasic
 
         /// <summary>
         /// 处理校准事件（上升沿）
-        /// TODO: 后期需要实现以下功能
-        /// 1. 采集校准数据（具体参数待确定）
-        /// 2. 保存校准数据到数据库（表结构待确定）
-        /// 3. 验证校准数据有效性
-        /// 4. 向PLC下发校验结果
+        /// 采集校准数据并保存到PLC_CalibraCollect表，完成后写入CalibraDataDone=true到PLC
         /// </summary>
         /// <param name="plcCode">PLC编码</param>
         /// <param name="stationCode">工站编码</param>
@@ -3793,28 +3913,133 @@ namespace WinformDevFramework.Services.PLCBasic
             {
                 _logger.LogInformation($"开始处理校准事件(上升沿): PlcCode={plcCode}, StationCode={stationCode}");
 
-                // TODO: 后期实现校准数据采集逻辑
-                // 需要确定：
-                // - 从PLC读取哪些校准参数（如校准值、校准时间、校准人员等）
-                // - 数据验证规则
-                // - 数据库表结构（如WipCalibration表）
-                // - 数据保存逻辑
+                // 1. 从readDataPointsDict中读取校准数据
+                string calibraTime = readDataPointsDict.ContainsKey("P-Calibra_Time") ? readDataPointsDict["P-Calibra_Time"] : string.Empty;
+                byte? calibraResult = null;
+                if (readDataPointsDict.ContainsKey("P-Calibra_Result") && byte.TryParse(readDataPointsDict["P-Calibra_Result"], out byte result))
+                {
+                    calibraResult = result;
+                }
 
-                // 临时实现：仅复位ProcessingDone标志
+                // 读取15个校准数据
+                decimal?[] calibraData = new decimal?[15];
+                for (int i = 1; i <= 15; i++)
+                {
+                    string key = $"P-Calibra1_Data{i}";
+                    if (readDataPointsDict.ContainsKey(key) && decimal.TryParse(readDataPointsDict[key], out decimal val))
+                    {
+                        calibraData[i - 1] = val;
+                    }
+                }
+
+                // 2. 保存到PLC_CalibraCollect表
+                var calibraRecord = new PLC_CalibraCollect
+                {
+                    StationCode = stationCode,
+                    LineCode = string.Empty, // TODO: 从配置或参数中获取线体编码
+                    PlcCode = plcCode,
+                    CalibraTime = calibraTime,
+                    CalibraResult = calibraResult,
+                    Calibra1Data1 = calibraData[0],
+                    Calibra1Data2 = calibraData[1],
+                    Calibra1Data3 = calibraData[2],
+                    Calibra1Data4 = calibraData[3],
+                    Calibra1Data5 = calibraData[4],
+                    Calibra1Data6 = calibraData[5],
+                    Calibra1Data7 = calibraData[6],
+                    Calibra1Data8 = calibraData[7],
+                    Calibra1Data9 = calibraData[8],
+                    Calibra1Data10 = calibraData[9],
+                    Calibra1Data11 = calibraData[10],
+                    Calibra1Data12 = calibraData[11],
+                    Calibra1Data13 = calibraData[12],
+                    Calibra1Data14 = calibraData[13],
+                    Calibra1Data15 = calibraData[14],
+                    CollectTime = DateTime.Now,
+                    CreateUser = "System"
+                };
+
+                await _calibraCollectRepository.InsertAsync(calibraRecord);
+                _logger.LogInformation($"校准数据已保存: StationCode={stationCode}, CalibraTime={calibraTime}");
+
+                // 3. 向PLC写入CalibraDataDone=true
                 Dictionary<string, object> dataToWrite = new Dictionary<string, object>
                 {
-                    { "ProcessingDone", false }
+                    { "CalibraDataDone", true }
                 };
 
                 await WriteDataPointsToPlc(plcCode, writeDataPoints, dataToWrite);
-                _logger.LogInformation($"已向PLC下发ProcessingDone=false");
-                _logger.LogWarning($"校准事件处理为临时实现，后期需要实现数据采集和保存功能");
+                _logger.LogInformation($"已向PLC下发CalibraDataDone=true");
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "处理校准事件时发生错误");
             }
         }
+
+        /// <summary>
+        /// 处理校准事件下降沿
+        /// 向PLC中CalibraDataRaq地址写入true
+        /// </summary>
+        /// <param name="plcCode">PLC编码</param>
+        /// <param name="stationCode">工站编码</param>
+        /// <param name="writeDataPoints">写入数据点列表</param>
+        /// <param name="readDataPointsDict">读取数据点字典</param>
+        private async Task HandleCalibraDownEvent(string plcCode, string stationCode, List<PLC_Event_Data_Detail> writeDataPoints, Dictionary<string, string> readDataPointsDict)
+        {
+            try
+            {
+                _logger.LogInformation($"开始处理校准事件下降沿: PlcCode={plcCode}, StationCode={stationCode}");
+
+                // 向PLC写入CalibraDataRaq=true
+                Dictionary<string, object> dataToWrite = new Dictionary<string, object>
+                {
+                    { "CalibraDataRaq", false }
+                };
+
+                await WriteDataPointsToPlc(plcCode, writeDataPoints, dataToWrite);
+                _logger.LogInformation($"已向PLC下发CalibraDataRaq= false");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "处理校准事件下降沿时发生错误");
+            }
+        }
+
+        /// <summary>
+        /// 标定数据下降沿处理逻辑
+        /// </summary>
+        /// <param name="e"></param>
+        /// <returns></returns>
+        private async Task HandleCalibraDownDataAsync(PlcEventTriggeredEventArgs e)
+        {
+            try
+            {
+                _logger.LogInformation($"开始处理标定数据下降沿事件: EventId={e.EventId}, PlcCode={e.PlcCode}, StationCode={e.StationCode}");
+                // 第一步：检查设备状态
+                int deviceStatus = CheckDeviceStatus(e.PlcCode, e.StationCode);
+                if (deviceStatus == -1)
+                {
+                    return;
+                }
+                // 第二步：获取事件数据点配置
+                if (!GetEventDataPoints(e.EventId, out var readDataPoints, out var writeDataPoints))
+                {
+                    return;
+                }
+                // 第三步：异步读取数据点
+                Dictionary<string, string> readDataPointsDict = await ReadEventDataPointsAsync(e.PlcCode, readDataPoints);
+                // 第四步：采集标定数据并回写PLC
+                await HandleCalibraDownEvent(e.PlcCode, e.StationCode, writeDataPoints, readDataPointsDict);
+
+                _logger.LogInformation($"标定数据事件处理完成: EventId={e.EventId}");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"处理返修上线事件时发生错误: EventId={e.EventId}");
+            }
+        }
+
         #endregion
 
         #region 打印相关事件
@@ -3852,6 +4077,23 @@ namespace WinformDevFramework.Services.PLCBasic
         #endregion
 
         #region 跳动数据
+
+        private async Task HandleBounceAsync(PlcEventTriggeredEventArgs e, bool isRisingEdge)
+        {
+            if (isRisingEdge)
+            {
+                await HandleBounceExchangeAsync(e);
+            }
+            else
+            {
+                await HandleBounceDownExchangeAsync(e);
+            }
+        }
+        /// <summary>
+        /// 跳动上升沿
+        /// </summary>
+        /// <param name="e"></param>
+        /// <returns></returns>
         private async Task HandleBounceExchangeAsync(PlcEventTriggeredEventArgs e)
         {
             try
@@ -3873,10 +4115,8 @@ namespace WinformDevFramework.Services.PLCBasic
                 // 第三步：异步读取数据点
                 Dictionary<string, string> readDataPointsDict = await ReadEventDataPointsAsync(e.PlcCode, readDataPoints);
 
-                // 第五步：通过Socket通信触发外部设备执行并接收数据
-                await TriggerSocketAndReceiveDataAsync(e);
-                //读到的数据要与工站进行绑定，然后生成对应的跳动主表
-
+                // 第五步：通过Socket通信触发外部设备执行（上升沿：AQ + AS）
+                await TriggerSocketRisingEdgeAsync(e);
 
                 _logger.LogInformation($"跳动数据事件处理完成: EventId={e.EventId}");
             }
@@ -3887,151 +4127,20 @@ namespace WinformDevFramework.Services.PLCBasic
         }
 
         /// <summary>
-        /// 通过Socket通信触发外部设备执行并接收数据
-        /// 流程：1. 连接Socket 2. 发送开始执行命令 3. 接收设备发送的所有数据 4. 处理并保存数据
+        /// 跳动下降沿
         /// </summary>
-        private async Task TriggerSocketAndReceiveDataAsync(PlcEventTriggeredEventArgs e)
+        /// <returns></returns>
+        private async Task HandleBounceDownExchangeAsync(PlcEventTriggeredEventArgs e)
         {
             try
             {
-                // 检查Socket服务是否可用
-                if (_socketCommunicationService == null)
+                _logger.LogInformation($"开始处理跳动下降沿数据相关操作: EventId={e.EventId}, PlcCode={e.PlcCode}, StationCode={e.StationCode}");
+                // 第一步：检查设备状态
+                int deviceStatus = CheckDeviceStatus(e.PlcCode, e.StationCode);
+                if (deviceStatus == -1)
                 {
-                    _logger.LogWarning("Socket通讯服务未初始化");
                     return;
                 }
-
-                // 如果未连接，尝试连接
-                if (!_socketCommunicationService.IsConnected)
-                {
-                    _logger.LogInformation("Socket未连接，尝试连接...");
-                    // 从配置读取IP和端口（这里使用默认值，实际应从配置获取）
-                    string socketIp = "127.0.0.1";
-                    int socketPort = 8000;
-                    
-                    bool connected = await _socketCommunicationService.ConnectAsync(socketIp, socketPort);
-                    if (!connected)
-                    {
-                        _logger.LogWarning($"Socket连接失败: {socketIp}:{socketPort}，跳过设备执行");
-                        return;
-                    }
-                    _logger.LogInformation($"Socket连接成功: {socketIp}:{socketPort}");
-                }
-
-                // 构建并发送"开始执行"命令
-                byte[] startCommand = BuildStartCommand(e);
-                if (startCommand == null || startCommand.Length == 0)
-                {
-                    _logger.LogWarning("无法构建开始执行命令");
-                    return;
-                }
-
-                _logger.LogInformation($"发送开始执行命令: {Encoding.UTF8.GetString(startCommand)}");
-                bool sendSuccess = await _socketCommunicationService.SendDataAsync(startCommand);
-                if (!sendSuccess)
-                {
-                    _logger.LogWarning("发送开始执行命令失败");
-                    return;
-                }
-
-                // 接收设备执行过程中发送的所有数据
-                _logger.LogInformation("等待接收设备执行数据...");
-                await ReceiveAndProcessDeviceData(e);
-
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Socket通讯触发设备执行失败");
-            }
-        }
-
-        /// <summary>
-        /// 接收并处理设备发送的数据
-        /// 设备执行过程中会发送多条数据，需要持续接收直到设备发送完成信号
-        /// </summary>
-        private async Task ReceiveAndProcessDeviceData(PlcEventTriggeredEventArgs e)
-        {
-            int dataCount = 0;
-
-            try
-            {
-                while (true)
-                {
-                    // 接收数据（带超时，防止无限等待）
-                    byte[] data = await _socketCommunicationService.ReceiveDataAsync();
-                    
-                    if (data == null || data.Length == 0)
-                    {
-                        _logger.LogInformation("设备数据接收完成或超时");
-                        break;
-                    }
-
-                    dataCount++;
-                    _logger.LogInformation($"接收到第 {dataCount} 批数据，长度: {data.Length} 字节");
-
-                    // 检查是否为结束信号
-                    string dataStr = Encoding.UTF8.GetString(data);
-                    if (dataStr.StartsWith("END") || dataStr.StartsWith("COMPLETE"))
-                    {
-                        _logger.LogInformation("收到设备执行完成信号");
-                        break;
-                    }
-
-                    // TODO: 数据处理逻辑待完善
-                    // 当前传入的数据格式未知，暂时只记录日志，后续根据实际数据格式补充处理逻辑
-                    _logger.LogInformation($"收到设备数据，待后续处理: 长度={data.Length}字节");
-
-                    // 添加小延迟，避免过快接收
-                    await Task.Delay(100);
-                }
-
-                if (dataCount == 0)
-                {
-                    _logger.LogWarning("未接收到任何设备数据");
-                }
-                else
-                {
-                    _logger.LogInformation($"共接收 {dataCount} 批设备数据");
-                }
-            }
-            catch (TimeoutException ex)
-            {
-                _logger.LogWarning($"设备数据接收超时: {ex.Message}");
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, $"处理设备数据时发生错误，已接收 {dataCount} 批数据");
-            }
-        }
-
-        /// <summary>
-        /// 构建开始执行命令
-        /// </summary>
-        private byte[] BuildStartCommand(PlcEventTriggeredEventArgs e)
-        {
-            try
-            {
-                // 构建命令：START|PLC编码|工站编码|事件ID|时间戳
-                string commandStr = $"START|{e.PlcCode}|{e.StationCode}|{e.EventId}|{DateTime.Now:yyyyMMddHHmmss}";
-                return Encoding.UTF8.GetBytes(commandStr);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "构建开始执行命令失败");
-                return null;
-            }
-        }
-
-        #endregion
-
-        #region  MES在线
-
-        #region 参数下发事件
-        private async Task HandleParameterDistributionDownAsync(PlcEventTriggeredEventArgs e)
-        {
-            try
-            {
-                _logger.LogInformation($"开始处理跳动数据相关操作: EventId={e.EventId}, PlcCode={e.PlcCode}, StationCode={e.StationCode}");
 
                 // 第二步：获取事件数据点配置
                 if (!GetEventDataPoints(e.EventId, out var readDataPoints, out var writeDataPoints))
@@ -4042,7 +4151,440 @@ namespace WinformDevFramework.Services.PLCBasic
                 // 第三步：异步读取数据点
                 Dictionary<string, string> readDataPointsDict = await ReadEventDataPointsAsync(e.PlcCode, readDataPoints);
 
-                // 第五步：通过Socket通信触发外部设备执行并接收数据
+                // 第五步：通过Socket通信触发外部设备执行并接收数据（下降沿：AP + AO,1）
+                List<double> bounceDataList = await TriggerSocketFallingEdgeAsync(e);
+
+                // 第六步：将接收到的数据与工站绑定，保存到WipProcessData表
+                if (bounceDataList != null && bounceDataList.Count > 0)
+                {
+                    await SaveBounceDataAsync(e, bounceDataList, readDataPointsDict);
+                }
+
+                _logger.LogInformation($"跳动下降沿数据事件处理完成: EventId={e.EventId}");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"处理跳动下降沿数据事件时发生错误: EventId={e.EventId}");
+            }
+        }
+
+        /// <summary>
+        /// 跳动上升沿Socket通信：发送AQ\r和AS\r指令
+        /// </summary>
+        private async Task TriggerSocketRisingEdgeAsync(PlcEventTriggeredEventArgs e)
+        {
+            try
+            {
+                if (_socketCommunicationService == null)
+                {
+                    _logger.LogWarning("Socket通讯服务未初始化");
+                    return;
+                }
+
+                if (!await EnsureSocketConnectedAsync())
+                {
+                    return;
+                }
+
+                // 发送第一条指令: AQ\r，读取4字节响应
+                byte[] aqCommand = Encoding.UTF8.GetBytes("AQ\r");
+                _logger.LogInformation($"上升沿-发送AQ指令");
+                byte[] aqResponse = await _socketCommunicationService.SendRawAndReceiveAsync(aqCommand, 4);
+                if (aqResponse != null)
+                {
+                    string aqHex = BitConverter.ToString(aqResponse).Replace("-", "").ToLower();
+                    _logger.LogInformation($"上升沿-AQ指令响应: {aqHex}");
+                }
+                else
+                {
+                    _logger.LogWarning("上升沿-AQ指令未收到响应");
+                }
+
+                // 发送第二条指令: AS\r，读取4字节响应
+                byte[] asCommand = Encoding.UTF8.GetBytes("AS\r");
+                _logger.LogInformation($"上升沿-发送AS指令");
+                byte[] asResponse = await _socketCommunicationService.SendRawAndReceiveAsync(asCommand, 4);
+                if (asResponse != null)
+                {
+                    string asHex = BitConverter.ToString(asResponse).Replace("-", "").ToLower();
+                    _logger.LogInformation($"上升沿-AS指令响应: {asHex}");
+                }
+                else
+                {
+                    _logger.LogWarning("上升沿-AS指令未收到响应");
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "上升沿Socket通讯失败");
+            }
+        }
+
+        /// <summary>
+        /// 跳动下降沿Socket通信：发送AP\r和AO,1\r指令，返回AO,1的响应数据列表
+        /// </summary>
+        private async Task<List<double>> TriggerSocketFallingEdgeAsync(PlcEventTriggeredEventArgs e)
+        {
+            var resultList = new List<double>();
+
+            try
+            {
+                if (_socketCommunicationService == null)
+                {
+                    _logger.LogWarning("Socket通讯服务未初始化");
+                    return resultList;
+                }
+
+                if (!await EnsureSocketConnectedAsync())
+                {
+                    return resultList;
+                }
+
+                // 发送第一条指令: AP\r，读取4字节响应
+                byte[] apCommand = Encoding.UTF8.GetBytes("AP\r");
+                _logger.LogInformation($"下降沿-发送AP指令");
+                byte[] apResponse = await _socketCommunicationService.SendRawAndReceiveAsync(apCommand, 4);
+                if (apResponse != null)
+                {
+                    string apHex = BitConverter.ToString(apResponse).Replace("-", "").ToLower();
+                    _logger.LogInformation($"下降沿-AP指令响应: {apHex}");
+                }
+                else
+                {
+                    _logger.LogWarning("下降沿-AP指令未收到响应");
+                }
+
+                // 发送第二条指令: AO,1\r，读取一行响应（逗号分隔的数据）
+                byte[] aoCommand = Encoding.UTF8.GetBytes("AO,1\r");
+                _logger.LogInformation($"下降沿-发送AO,1指令");
+                string aoResponse = await _socketCommunicationService.SendRawAndReceiveLineAsync(aoCommand);
+                if (!string.IsNullOrEmpty(aoResponse))
+                {
+                    _logger.LogInformation($"下降沿-AO,1指令响应: {aoResponse}");
+
+                    // 按逗号分割，取第2个及之后的数据（跳过第一个元素）
+                    string[] parts = aoResponse.Split(',');
+                    for (int i = 1; i < parts.Length; i++)
+                    {
+                        resultList.Add(Convert.ToDouble(parts[i].Trim()));
+                    }
+
+                    _logger.LogInformation($"下降沿-解析到 {resultList.Count} 条数据");
+                }
+                else
+                {
+                    _logger.LogWarning("下降沿-AO,1指令未收到响应");
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "下降沿Socket通讯失败");
+            }
+
+            return resultList;
+        }
+
+        /// <summary>
+        /// 确保Socket已连接（常驻连接模式）
+        /// </summary>
+        private async Task<bool> EnsureSocketConnectedAsync()
+        {
+            if (_socketCommunicationService.IsConnected)
+            {
+                return true;
+            }
+
+            _logger.LogInformation("Socket未连接，尝试连接...");
+            string socketIp = "127.0.0.1";
+            int socketPort = 8000;
+
+            bool connected = await _socketCommunicationService.ConnectAsync(socketIp, socketPort);
+            if (!connected)
+            {
+                _logger.LogWarning($"Socket连接失败: {socketIp}:{socketPort}");
+                return false;
+            }
+
+            _logger.LogInformation($"Socket连接成功: {socketIp}:{socketPort}");
+            
+            // 订阅连接状态变化事件，自动重连
+            _socketCommunicationService.ConnectionStatusChanged += async (sender, isConnected) =>
+            {
+                if (!isConnected)
+                {
+                    _logger.LogWarning("Socket连接断开，5秒后尝试自动重连...");
+                    await Task.Delay(5000);
+                    await EnsureSocketConnectedAsync();
+                }
+            };
+            
+            return true;
+        }
+
+        /// <summary>
+        /// 保存跳动数据到WipProcessData表，图片生成异步化
+        /// </summary>
+        private async Task SaveBounceDataAsync(PlcEventTriggeredEventArgs e, List<double> dataList, Dictionary<string, string> readDataPointsDict)
+        {
+            try
+            {
+                //型号
+                string partType = CleanPlcString(readDataPointsDict.ContainsKey("PartType") ? readDataPointsDict["PartType"] : string.Empty);
+                //程序号
+                string recipeVer = CleanPlcString(readDataPointsDict.ContainsKey("RecipeVer") ? readDataPointsDict["RecipeVer"] : string.Empty);
+                string rfidBarCode = CleanPlcString(readDataPointsDict.ContainsKey("BarCode") ? readDataPointsDict["BarCode"] : string.Empty);
+
+                string filePath = "D://数据信息//跳动//";
+                string fileName = $"{e.StationCode}&{recipeVer}&{DateTime.Now.ToString("yyyyMMdd_hhmmss")}&{partType}&{rfidBarCode}&File1&OK";
+
+                // 数据过滤：后一个比前一个大5则舍弃，只有差值在1以内的才为有效数
+                List<double> validData = FilterBounceData(dataList);
+
+                // 将过滤后的数据列表拼接为逗号分隔的字符串
+                string dataContent = string.Join(",", validData);
+
+                // 生成曲线图片并保存（异步化，不阻塞事件处理线程）
+                string imageFileName = fileName + ".png";
+                string imagePath = filePath + imageFileName;
+
+                var processData = new WipProcessData
+                {
+                    Id = Guid.NewGuid().ToString("N"),
+                    ProductModel = partType,
+                    Receipe = recipeVer,
+                    StationCode = e.StationCode,
+                    BarCode = rfidBarCode,
+                    BarCodeType = "跳动",
+                    CurveTypes = "跳动",
+                    SavePath = imagePath,
+                    CreateTime = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
+                    CreateUser = "System",
+                    DataValue = dataContent
+                };
+
+                await _wipProcessDataRepository.InsertAsync(processData);
+                _logger.LogInformation($"跳动数据保存成功: StationCode={e.StationCode}, 原始数据条数={dataList.Count}, 有效数据条数={validData.Count}");
+
+                // 图片生成放到独立后台任务，不阻塞事件处理线程
+                _ = Task.Run(() =>
+                {
+                    try
+                    {
+                        GenerateCurveImage(validData, imagePath, e.StationCode, recipeVer, partType, rfidBarCode);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "后台生成曲线图片失败");
+                    }
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "保存跳动数据失败");
+            }
+        }
+
+        /// <summary>
+        /// 过滤跳动数据：后一个比前一个大5则舍弃，只有差值在1以内的才为有效数
+        /// </summary>
+        private List<double> FilterBounceData(List<double> dataList)
+        {
+            if (dataList == null || dataList.Count == 0)
+                return new List<double>();
+
+            List<double> validData = new List<double>();
+            validData.Add(dataList[0]);
+
+            for (int i = 1; i < dataList.Count; i++)
+            {
+                double prev = validData[validData.Count - 1];
+                double current = dataList[i];
+                double diff = Math.Abs(current - prev);
+
+                // 差值在1以内为有效数据，差值大于5则舍弃
+                if (diff <= 1)
+                {
+                    validData.Add(current);
+                }
+                else if (diff > 5)
+                {
+                    // 差值大于5，舍弃该数据
+                    _logger.LogDebug($"过滤跳动数据: 索引{i}, 前值={prev:F2}, 当前值={current:F2}, 差值={diff:F2} > 5, 已舍弃");
+                }
+                else
+                {
+                    // 差值在1~5之间，也舍弃（只保留差值<=1的）
+                    _logger.LogDebug($"过滤跳动数据: 索引{i}, 前值={prev:F2}, 当前值={current:F2}, 差值={diff:F2} > 1, 已舍弃");
+                }
+            }
+
+            return validData;
+        }
+
+        /// <summary>
+        /// 根据数据生成曲线图片并保存到指定路径
+        /// </summary>
+        private void GenerateCurveImage(List<double> dataList, string imagePath, string stationCode, string recipe, string partType, string barCode)
+        {
+            if (dataList == null || dataList.Count < 2)
+            {
+                _logger.LogWarning("有效数据不足，无法生成曲线图片");
+                return;
+            }
+
+            try
+            {
+                // 确保目录存在
+                string directory = Path.GetDirectoryName(imagePath);
+                if (!Directory.Exists(directory))
+                {
+                    Directory.CreateDirectory(directory);
+                }
+
+                int width = 1200;
+                int height = 600;
+                int marginLeft = 80;
+                int marginRight = 40;
+                int marginTop = 60;
+                int marginBottom = 60;
+                int chartWidth = width - marginLeft - marginRight;
+                int chartHeight = height - marginTop - marginBottom;
+
+                using (Bitmap bitmap = new Bitmap(width, height))
+                using (Graphics g = Graphics.FromImage(bitmap))
+                {
+                    // 设置高质量绘图
+                    g.SmoothingMode = SmoothingMode.AntiAlias;
+                    g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+
+                    // 背景
+                    g.Clear(Color.White);
+
+                    // 标题
+                    string title = $"跳动曲线 - 工站:{stationCode} 程序:{recipe} 型号:{partType}";
+                    using (Font titleFont = new Font("微软雅黑", 14, FontStyle.Bold))
+                    {
+                        g.DrawString(title, titleFont, Brushes.Black, new PointF(marginLeft, 10));
+                    }
+
+                    // 计算数据范围
+                    double minVal = dataList.Min();
+                    double maxVal = dataList.Max();
+                    double valRange = maxVal - minVal;
+                    if (valRange < 1) valRange = 1; // 最小范围1
+
+                    // 添加上下边距
+                    double yMin = minVal - valRange * 0.1;
+                    double yMax = maxVal + valRange * 0.1;
+                    double yRange = yMax - yMin;
+
+                    // 绘制网格和Y轴刻度
+                    using (Pen gridPen = new Pen(Color.LightGray, 1))
+                    using (Font axisFont = new Font("微软雅黑", 9))
+                    {
+                        int yTickCount = 5;
+                        for (int i = 0; i <= yTickCount; i++)
+                        {
+                            double val = yMin + (yRange * i / yTickCount);
+                            int y = marginTop + chartHeight - (int)(chartHeight * i / yTickCount);
+
+                            // 网格线
+                            g.DrawLine(gridPen, marginLeft, y, marginLeft + chartWidth, y);
+
+                            // Y轴刻度值
+                            string yLabel = val.ToString("F2");
+                            SizeF labelSize = g.MeasureString(yLabel, axisFont);
+                            g.DrawString(yLabel, axisFont, Brushes.Black, marginLeft - labelSize.Width - 5, y - labelSize.Height / 2);
+                        }
+                    }
+
+                    // 绘制X轴刻度
+                    using (Font axisFont = new Font("微软雅黑", 9))
+                    {
+                        int xTickCount = Math.Min(10, dataList.Count - 1);
+                        for (int i = 0; i <= xTickCount; i++)
+                        {
+                            int dataIndex = i * (dataList.Count - 1) / xTickCount;
+                            int x = marginLeft + (int)(chartWidth * dataIndex / (dataList.Count - 1));
+
+                            string xLabel = dataIndex.ToString();
+                            SizeF labelSize = g.MeasureString(xLabel, axisFont);
+                            g.DrawString(xLabel, axisFont, Brushes.Black, x - labelSize.Width / 2, marginTop + chartHeight + 5);
+                        }
+                    }
+
+                    // 绘制坐标轴
+                    using (Pen axisPen = new Pen(Color.Black, 1.5f))
+                    {
+                        // Y轴
+                        g.DrawLine(axisPen, marginLeft, marginTop, marginLeft, marginTop + chartHeight);
+                        // X轴
+                        g.DrawLine(axisPen, marginLeft, marginTop + chartHeight, marginLeft + chartWidth, marginTop + chartHeight);
+                    }
+
+                    // 绘制曲线
+                    using (Pen linePen = new Pen(Color.Blue, 2f))
+                    {
+                        Point[] points = new Point[dataList.Count];
+                        for (int i = 0; i < dataList.Count; i++)
+                        {
+                            int x = marginLeft + (int)(chartWidth * i / (dataList.Count - 1));
+                            int y = marginTop + chartHeight - (int)(chartHeight * (dataList[i] - yMin) / yRange);
+                            points[i] = new Point(x, y);
+                        }
+                        g.DrawLines(linePen, points);
+                    }
+
+                    // 绘制数据点
+                    using (Brush pointBrush = new SolidBrush(Color.Red))
+                    {
+                        for (int i = 0; i < dataList.Count; i++)
+                        {
+                            int x = marginLeft + (int)(chartWidth * i / (dataList.Count - 1));
+                            int y = marginTop + chartHeight - (int)(chartHeight * (dataList[i] - yMin) / yRange);
+                            g.FillEllipse(pointBrush, x - 3, y - 3, 6, 6);
+                        }
+                    }
+
+                    // 底部信息
+                    using (Font infoFont = new Font("微软雅黑", 9))
+                    {
+                        string info = $"条码:{barCode}  数据点数:{dataList.Count}  最小值:{minVal:F2}  最大值:{maxVal:F2}  生成时间:{DateTime.Now:yyyy-MM-dd HH:mm:ss}";
+                        g.DrawString(info, infoFont, Brushes.Gray, new PointF(marginLeft, height - 25));
+                    }
+
+                    // 保存图片
+                    bitmap.Save(imagePath, ImageFormat.Png);
+                    _logger.LogInformation($"曲线图片已生成: {imagePath}, 尺寸:{width}x{height}");
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"生成曲线图片失败: {imagePath}");
+            }
+        }
+
+        #endregion
+
+        #region  MES在线
+
+        #region 在线模式保存参数下发配置表
+        private async Task HandleParameterDistributionDownAsync(PlcEventTriggeredEventArgs e)
+        {
+            try
+            {
+                _logger.LogInformation($"开始处理在线MES参数下发相关操作: EventId={e.EventId}, PlcCode={e.PlcCode}, StationCode={e.StationCode}");
+
+                // 第二步：获取事件数据点配置
+                if (!GetEventDataPoints(e.EventId, out var readDataPoints, out var writeDataPoints))
+                {
+                    return;
+                }
+
+                // 第二步：异步读取数据点
+                Dictionary<string, string> readDataPointsDict = await ReadEventDataPointsAsync(e.PlcCode, readDataPoints);
+
+                // 第三步：保存参数下发数据
                 await MesOnlineParameterDistributionPLCAsync(e.PlcCode, e.StationCode, writeDataPoints, readDataPointsDict);
                 //读到的数据要与工站进行绑定，然后生成对应的跳动主表
 
@@ -4282,131 +4824,13 @@ namespace WinformDevFramework.Services.PLCBasic
                         _logger.LogInformation($"参数值未发生变化，无需更新");
                     }
                 }
-
-                // 4. 生成对应的下发参数记录PLC_ParameterDistributionRecord和对应的PLC_ParameterDistributionRecordDetail表
-                await CreateParameterDistributionRecordAsync(plcCode, stationCode, distributionToUse, distributionDetails, partType, recipeVer);
-
-                _logger.LogInformation($"MES离线模式参数下发完成: PlcCode={plcCode}, StationCode={stationCode}");
+                _logger.LogInformation($"MES在线模式参数下发完成: PlcCode={plcCode}, StationCode={stationCode}");
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, $"MES离线模式参数下发失败: PlcCode={plcCode}, StationCode={stationCode}");
+                _logger.LogError(ex, $"MES在线模式参数下实时发失败: PlcCode={plcCode}, StationCode={stationCode}");
             }
         }
-
-        /// <summary>
-        /// 创建参数下发记录
-        /// </summary>
-        private async Task CreateParameterDistributionRecordAsync(string plcCode, string stationCode, 
-            PLC_ParameterDistribution distribution, List<PLC_ParameterDistributionDetail> details, 
-            string partType, string recipeVer)
-        {
-            try
-            {
-                DateTime startTime = DateTime.Now;
-                int successCount = 0;
-                int failedCount = 0;
-                List<PLC_ParameterDistributionRecordDetail> recordDetails = new List<PLC_ParameterDistributionRecordDetail>();
-
-                //只保存现在的记录，不进行实际的PLC写入操作
-                foreach (var detail in details)
-                {
-                    if (!string.IsNullOrEmpty(detail.ParamName) && !string.IsNullOrEmpty(detail.AddressCode))
-                    {
-                        try
-                        {
-                            successCount++;                      
-                            var recordDetail = new PLC_ParameterDistributionRecordDetail
-                            {
-                                RecordID = 0,  // 暂时为0，后续会更新
-                                DetailID = detail.ID,
-                                PlcCode = plcCode,
-                                EquipmentCode = detail.EquipmentCode ?? string.Empty,
-                                StationCode = stationCode,
-                                AddressCode = detail.AddressCode,
-                                DataType = detail.DataType ?? string.Empty,
-                                ParamName = detail.ParamName,
-                                ParamValue = detail.ParamValue?.ToString() ?? string.Empty,
-                                Status = "Success",
-                                ErrorMessage = string.Empty,
-                                RetryCount = 0,
-                                DurationMs = 0,
-                                DistributionTime = DateTime.Now
-                            };
-                            recordDetails.Add(recordDetail);
-                        }
-                        catch (Exception ex)
-                        {
-                            failedCount++;
-                            var recordDetail = new PLC_ParameterDistributionRecordDetail
-                            {
-                                RecordID = 0,
-                                DetailID = detail.ID,
-                                PlcCode = plcCode,
-                                EquipmentCode = detail.EquipmentCode ?? string.Empty,
-                                StationCode = stationCode,
-                                AddressCode = detail.AddressCode,
-                                DataType = detail.DataType ?? string.Empty,
-                                ParamName = detail.ParamName,
-                                ParamValue = detail.ParamValue?.ToString() ?? string.Empty,
-                                Status = "Failed",
-                                ErrorMessage = ex.Message,
-                                RetryCount = 0,
-                                DurationMs = 0,
-                                DistributionTime = DateTime.Now
-                            };
-                            recordDetails.Add(recordDetail);
-                        }
-                    }
-                }
-
-                DateTime endTime = DateTime.Now;
-                long durationMs = (long)(endTime - startTime).TotalMilliseconds;
-
-                // 创建下发记录
-                string recordCode = $"DR{DateTime.Now:yyyyMMddHHmmssfff}";
-                string status = failedCount == 0 ? "Success" : (successCount > 0 ? "PartialSuccess" : "Failed");
-
-                var record = new PLC_ParameterDistributionRecord
-                {
-                    DistributionID = distribution.ID,
-                    RecordCode = recordCode,
-                    ProductModelCode = partType,
-                    RecipeCode = recipeVer,
-                    DistributionType = "Dispatching",
-                    PlcCode = plcCode,
-                    EquipmentCode = details.FirstOrDefault()?.EquipmentCode ?? string.Empty,
-                    StationCode = stationCode,
-                    Status = status,
-                    TotalCount = details.Count,
-                    SuccessCount = successCount,
-                    FailedCount = failedCount,
-                    Message = status == "Success" ? "参数下发成功" : $"参数下发部分成功，成功{successCount}条，失败{failedCount}条",
-                    StartTime = startTime,
-                    EndTime = endTime,
-                    DurationMs = durationMs,
-                    DistributionUser = "System",
-                    CreateTime = DateTime.Now,
-                    CreateUser = "System"
-                };
-                await _parameterDistributionRecordRepository.InsertAsync(record);
-
-                // 更新下发记录明细的RecordID
-                foreach (var recordDetail in recordDetails)
-                {
-                    recordDetail.RecordID = record.ID;
-                }
-                await _parameterDistributionRecordDetailRepository.InsertAsync(recordDetails);
-
-                _logger.LogInformation($"创建下发记录成功: RecordID={record.ID}, Status={status}, Success={successCount}, Failed={failedCount}");
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, $"创建参数下发记录失败: PlcCode={plcCode}, StationCode={stationCode}");
-            }
-        }
-
-
 
         #endregion
 
@@ -4491,6 +4915,56 @@ namespace WinformDevFramework.Services.PLCBasic
         }
 
         /// <summary>
+        /// 错误时记录读取的PLC值，方便后续追踪问题
+        /// </summary>
+        private void LogReadValuesOnError(string plcCode, string stationCode, string partId, string errorMsg, Dictionary<string, string> readDataPointsDict)
+        {
+            if (readDataPointsDict == null || readDataPointsDict.Count == 0)
+                return;
+
+            var sb = new StringBuilder();
+            sb.AppendLine($"[错误追踪] PlcCode={plcCode}, StationCode={stationCode}, PartId={partId}");
+            sb.AppendLine($"[错误追踪] 错误信息: {errorMsg}");
+            sb.AppendLine($"[错误追踪] PLC读取值:");
+            foreach (var kvp in readDataPointsDict)
+            {
+                sb.AppendLine($"  {kvp.Key} = {kvp.Value}");
+            }
+            _logger.LogError(sb.ToString());
+        }
+
+        /// <summary>
+        /// 错误时记录两组PLC读取值，方便后续追踪问题
+        /// </summary>
+        private void LogReadValuesOnError(string plcCode, string stationCode, string partId, string errorMsg,
+            Dictionary<string, string> qualityDict, Dictionary<string, string> resultDict)
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine($"[错误追踪] PlcCode={plcCode}, StationCode={stationCode}, PartId={partId}");
+            sb.AppendLine($"[错误追踪] 错误信息: {errorMsg}");
+
+            if (qualityDict != null && qualityDict.Count > 0)
+            {
+                sb.AppendLine($"[错误追踪] 质量采集数据:");
+                foreach (var kvp in qualityDict)
+                {
+                    sb.AppendLine($"  {kvp.Key} = {kvp.Value}");
+                }
+            }
+
+            if (resultDict != null && resultDict.Count > 0)
+            {
+                sb.AppendLine($"[错误追踪] 结果采集数据:");
+                foreach (var kvp in resultDict)
+                {
+                    sb.AppendLine($"  {kvp.Key} = {kvp.Value}");
+                }
+            }
+
+            _logger.LogError(sb.ToString());
+        }
+
+        /// <summary>
         /// 清理PLC字符串中的控制字符和空格
         /// </summary>
         private string CleanPlcString(string value)
@@ -4559,7 +5033,6 @@ namespace WinformDevFramework.Services.PLCBasic
                         InputTime = now,
                         CreateUser = "system",
                         CreateTime = now,
-                        BatchCode = batchCode,
                         RecipeCode = RecipeCode
                     };
 
@@ -4578,6 +5051,7 @@ namespace WinformDevFramework.Services.PLCBasic
                     existingBarcode.OutputTime = null;
                     existingBarcode.UpdateUser = "system";
                     existingBarcode.UpdateTime = now;
+                    existingBarcode.BatchCode = batchCode;
 
                    await _wipBarcodeRepository.UpdateAsync(existingBarcode);
                     _logger.LogInformation($"更新WipBarcode记录: BarCode={barCode}, StationCode={stationCode}, NextStationCode={nextStationCode}");
@@ -4773,7 +5247,7 @@ namespace WinformDevFramework.Services.PLCBasic
         /// <summary>
         /// 更新WipBarCode表状态
         /// </summary>
-        private async Task UpdateWipBarCodeStatus(string RFIDCode, string stationCode)
+        private async Task UpdateWipBarCodeStatus(string RFIDCode, string stationCode, int partResult = 1)
         {
             try
             {
@@ -4784,10 +5258,11 @@ namespace WinformDevFramework.Services.PLCBasic
                     await _wipBarcodeHistoryRepository.SaveHistoryAsync(wipBarCode, "UpdateStatus");
                     _logger.LogInformation($"保存WipBarCode历史记录: RFIDCode={RFIDCode}, StationCode={stationCode}");
 
-                    wipBarCode.BarCodeType = "0";
+                    // PartResult=1合格时BarCodeType=0已过站，0未作和2不合格时BarCodeType=1未过站
+                    wipBarCode.BarCodeType = partResult == 1 ? "0" : "1";
                     wipBarCode.OutputTime = DateTime.Now;
                     await _wipBarcodeRepository.UpdateAsync (wipBarCode);
-                    _logger.LogInformation($"更新WipBarCode状态: RFIDCode={RFIDCode}, StationCode={stationCode}, BarCodeType=0, OutputTime={wipBarCode.OutputTime}");
+                    _logger.LogInformation($"更新WipBarCode状态: RFIDCode={RFIDCode}, StationCode={stationCode}, BarCodeType={wipBarCode.BarCodeType}, PartResult={partResult}, OutputTime={wipBarCode.OutputTime}");
                 }
             }
             catch (Exception ex)
@@ -5494,7 +5969,7 @@ namespace WinformDevFramework.Services.PLCBasic
                     StationCode = stationCode,
                     MaterialName = PartsName,
                     CreateUser = "system",
-                    CreateTime = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")
+                    CreateTime = DateTime.Now
                 };
 
                 await _wipMaterialInfoRepository.InsertAsync(wipMaterialInfo);
@@ -5547,7 +6022,7 @@ namespace WinformDevFramework.Services.PLCBasic
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, $"添加 WipMaterialInfo 记录失败：RFIDCode={RFIDcode}, MaterialCode={subpartBarcode}");
+                _logger.LogError(ex, $"添加 WipMaterialInfo 记录失败：RFIDCode={RFIDcode}, MaterialCode={subpartBarcode},错误原因{ex.Message}\n{ex.StackTrace}");
                 throw;
             }
         }

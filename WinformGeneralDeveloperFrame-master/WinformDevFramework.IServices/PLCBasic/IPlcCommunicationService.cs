@@ -41,7 +41,9 @@ namespace WinformDevFramework.IServices.PLCBasic
         OperateResult<float> ReadFloat(string plcCode, string address);
         OperateResult<string> ReadString(string plcCode, string address, ushort length);
 
-        OperateResult<byte> ReadByte(string plcCode, string address); 
+        OperateResult<byte> ReadByte(string plcCode, string address);
+
+        OperateResult<Double> ReadDouble(string plcCode, string address);
 
 
         /// <summary>

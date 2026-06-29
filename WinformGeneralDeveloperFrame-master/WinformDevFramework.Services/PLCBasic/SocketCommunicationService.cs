@@ -390,6 +390,143 @@ namespace WinformDevFramework.Services.PLCBasic
         }
 
         /// <summary>
+        /// 发送原始字节数据（不带长度头）并读取指定长度的响应
+        /// </summary>
+        /// <param name="data">要发送的原始字节</param>
+        /// <param name="responseLength">期望读取的响应字节数</param>
+        /// <param name="timeoutMs">超时时间（毫秒）</param>
+        /// <returns>响应数据</returns>
+        public async Task<byte[]> SendRawAndReceiveAsync(byte[] data, int responseLength, int timeoutMs = 5000)
+        {
+            try
+            {
+                if (!IsConnected || _networkStream == null)
+                {
+                    _logger?.LogWarning("Socket未连接，无法执行发送接收操作");
+                    return null;
+                }
+
+                // 直接发送原始字节（不带长度头）
+                await _networkStream.WriteAsync(data, 0, data.Length);
+                await _networkStream.FlushAsync();
+
+                _logger?.LogDebug($"成功发送 {data.Length} 字节原始数据: {Encoding.UTF8.GetString(data)}");
+
+                // 读取指定长度的响应
+                byte[] buffer = new byte[responseLength];
+                int totalRead = 0;
+
+                var readTask = Task.Run(async () =>
+                {
+                    while (totalRead < responseLength)
+                    {
+                        int bytesRead = await _networkStream.ReadAsync(buffer, totalRead, responseLength - totalRead);
+                        if (bytesRead == 0)
+                        {
+                            _logger?.LogWarning("数据读取中断");
+                            return null;
+                        }
+                        totalRead += bytesRead;
+                    }
+                    return buffer;
+                });
+
+                var timeoutTask = Task.Delay(timeoutMs);
+                var completedTask = await Task.WhenAny(readTask, timeoutTask);
+
+                if (completedTask == timeoutTask)
+                {
+                    _logger?.LogWarning($"接收响应超时（{timeoutMs}ms）");
+                    return null;
+                }
+
+                byte[] result = await readTask;
+                if (result != null)
+                {
+                    string hexStr = BitConverter.ToString(result).Replace("-", "").ToLower();
+                    _logger?.LogInformation($"接收到 {result.Length} 字节响应，十六进制: {hexStr}");
+                }
+
+                return result;
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "发送原始数据并接收响应失败");
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// 发送原始字节数据（不带长度头）并读取一行响应（以换行符结尾）
+        /// </summary>
+        /// <param name="data">要发送的原始字节</param>
+        /// <param name="timeoutMs">超时时间（毫秒）</param>
+        /// <returns>响应字符串（不含换行符）</returns>
+        public async Task<string> SendRawAndReceiveLineAsync(byte[] data, int timeoutMs = 10000)
+        {
+            try
+            {
+                if (!IsConnected || _networkStream == null)
+                {
+                    _logger?.LogWarning("Socket未连接，无法执行发送接收操作");
+                    return null;
+                }
+
+                // 直接发送原始字节（不带长度头）
+                await _networkStream.WriteAsync(data, 0, data.Length);
+                await _networkStream.FlushAsync();
+
+                _logger?.LogDebug($"成功发送 {data.Length} 字节原始数据: {Encoding.UTF8.GetString(data)}");
+
+                // 逐字节读取直到遇到换行符
+                var sb = new StringBuilder();
+                var cts = new CancellationTokenSource(timeoutMs);
+
+                try
+                {
+                    while (!cts.Token.IsCancellationRequested)
+                    {
+                        byte[] oneByte = new byte[1];
+                        int bytesRead = await _networkStream.ReadAsync(oneByte, 0, 1, cts.Token);
+                        if (bytesRead == 0)
+                        {
+                            _logger?.LogWarning("连接已关闭");
+                            break;
+                        }
+
+                        char ch = (char)oneByte[0];
+                        if (ch == '\n')
+                        {
+                            // 遇到换行符，结束读取
+                            break;
+                        }
+                        if (ch != '\r')
+                        {
+                            sb.Append(ch);
+                        }
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    _logger?.LogWarning($"读取响应超时（{timeoutMs}ms）");
+                }
+
+                string result = sb.ToString();
+                if (!string.IsNullOrEmpty(result))
+                {
+                    _logger?.LogInformation($"接收到行响应: {result}");
+                }
+
+                return result;
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "发送原始数据并读取行响应失败");
+                return null;
+            }
+        }
+
+        /// <summary>
         /// 将接收到的数据保存为图片
         /// </summary>
         /// <param name="imageData">图片数据（字节数组）</param>

@@ -9,6 +9,7 @@ namespace PLCBasic
         /// <summary>
         /// 物料信息ID
         /// </summary>
+        [SugarColumn(IsPrimaryKey = true, IsIdentity = true)]
         public int MaterialInfoId { get; set; }
 
         /// <summary>
@@ -39,7 +40,7 @@ namespace PLCBasic
         /// <summary>
         /// 创建时间
         /// </summary>
-        public string CreateTime { get; set; }
+        public DateTime CreateTime { get; set; }
 
         /// <summary>
         /// 创建用户

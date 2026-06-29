@@ -90,6 +90,23 @@ namespace WinformDevFramework.IServices.PLCBasic
         /// <param name="fileNamePrefix">文件名前缀</param>
         /// <returns>保存的图片文件路径列表</returns>
         Task<List<string>> TriggerAndSaveImagesAsync(byte[] triggerCommand, string savePath, string fileNamePrefix);
+
+        /// <summary>
+        /// 发送原始字节数据（不带长度头）并读取指定长度的响应
+        /// </summary>
+        /// <param name="data">要发送的原始字节</param>
+        /// <param name="responseLength">期望读取的响应字节数</param>
+        /// <param name="timeoutMs">超时时间（毫秒）</param>
+        /// <returns>响应数据</returns>
+        Task<byte[]> SendRawAndReceiveAsync(byte[] data, int responseLength, int timeoutMs = 5000);
+
+        /// <summary>
+        /// 发送原始字节数据（不带长度头）并读取一行响应（以换行符结尾）
+        /// </summary>
+        /// <param name="data">要发送的原始字节</param>
+        /// <param name="timeoutMs">超时时间（毫秒）</param>
+        /// <returns>响应字符串（不含换行符）</returns>
+        Task<string> SendRawAndReceiveLineAsync(byte[] data, int timeoutMs = 10000);
     }
 
     /// <summary>

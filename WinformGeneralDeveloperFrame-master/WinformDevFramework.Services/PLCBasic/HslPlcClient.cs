@@ -283,6 +283,21 @@ namespace WinformDevFramework.Services.PLCBasic
         }
 
         /// <summary>
+        /// 读取Double类型
+        /// </summary>
+        /// <param name="address">PLC地址</param>
+        /// <returns>读取结果，包含浮点数值</returns>
+        public OperateResult<Double> ReadDouble(string address)
+        {
+            return ExecuteWithRetry(() =>
+            {
+                if (_siemensClient != null) return _siemensClient.ReadDouble(address);
+                return new OperateResult<Double>("未初始化客户端");
+            });
+        }
+
+
+        /// <summary>
         /// 读取字符串
         /// </summary>
         /// <param name="address">PLC地址</param>

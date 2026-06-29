@@ -233,9 +233,9 @@ namespace WinformDevFramework.Services.PLCBasic
                 loopCount++;
                 try
                 {
-                    _logger.LogDebug($"[心跳服务] 第 {loopCount} 次心跳检测开始");
+                   // _logger.LogDebug($"[心跳服务] 第 {loopCount} 次心跳检测开始");
                     CheckAllConnections();
-                    _logger.LogDebug($"[心跳服务] 第 {loopCount} 次心跳检测完成");
+                    //_logger.LogDebug($"[心跳服务] 第 {loopCount} 次心跳检测完成");
                 }
                 catch (Exception ex)
                 {
@@ -256,7 +256,6 @@ namespace WinformDevFramework.Services.PLCBasic
             try
             {
                 var plcConfigs = _connectionManager.GetAllPlcConfigs().ToList();
-                _logger.LogDebug($"[心跳服务] 检测到 {plcConfigs.Count} 个PLC配置");
 
                 foreach (var config in plcConfigs)
                 {
@@ -287,8 +286,6 @@ namespace WinformDevFramework.Services.PLCBasic
 
                 // 获取当前连接状态（通过读取心跳地址DB8000.0）
                 bool isConnectedNow = CheckHeartbeat(config.PlcCode);
-
-                _logger.LogDebug($"[心跳检查] PLC {config.PlcCode} 之前={wasConnected}, 现在={isConnectedNow}");
 
                 // 如果之前连接但现在断开，尝试重连
                 if (wasConnected && !isConnectedNow)
@@ -387,8 +384,6 @@ namespace WinformDevFramework.Services.PLCBasic
                 
                 if (result.IsSuccess)
                 {
-                    _logger.LogDebug($"[心跳检查] PLC {plcCode} 读取成功，心跳值={result.Content}");
-                    // 返回值为true（1）表示心跳成功
                     return result.IsSuccess;
                 }
                 else

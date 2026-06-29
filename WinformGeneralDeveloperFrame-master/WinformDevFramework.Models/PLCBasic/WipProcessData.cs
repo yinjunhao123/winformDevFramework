@@ -49,5 +49,10 @@ namespace PLCBasic
         /// 创建用户
         /// </summary>
         public string CreateUser { get; set; }
+        /// <summary>
+        /// 跳动曲线数据
+        /// </summary>
+
+        public string DataValue { get; set; }
     }
 }

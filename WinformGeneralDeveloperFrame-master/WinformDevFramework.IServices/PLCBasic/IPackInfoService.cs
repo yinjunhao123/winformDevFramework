@@ -57,6 +57,13 @@ namespace WinformDevFramework.IServices.PLCBasic
         Task<List<PackInfoDetail>> GetPackDetailListAsync(long packInfoId);
 
         /// <summary>
+        /// 根据条码查询所属包装主表ID列表
+        /// </summary>
+        /// <param name="barCode">条码</param>
+        /// <returns>包装主表ID列表</returns>
+        Task<List<long>> GetPackInfoIdsByBarCodeAsync(string barCode);
+
+        /// <summary>
         /// 删除包装信息（级联删除明细）
         /// </summary>
         /// <param name="id">包装主表ID</param>
