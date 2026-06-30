@@ -39,6 +39,17 @@ namespace WinformDevFramework.Core.Configuration
         /// </summary>
 
         public static readonly string Url = AppSettingsHelper.GetContent("Update", "Url");
+
+        /// <summary>
+        /// 跳动IP
+        /// </summary>
+        public static readonly string BounceIp = AppSettingsHelper.GetContent("Bounce", "BounceIp");
+
+        /// <summary>
+        /// 跳动端口
+        /// </summary>
+        public static readonly int BouncePort = Convert.ToInt32(AppSettingsHelper.GetContent("Bounce", "BouncePort"));
+
         #endregion
     }
 }
