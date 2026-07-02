@@ -1,4 +1,0 @@
-1.新建批次表 WipOrder
-    字段：WipOrderId ,OrderNo,ProductCode, ProductVersion(产品版本), productModelCode,productModelVersion,BomCode,BomVersion
-    CreateUser,CreateTime,UpdateUser,UpdateTime
-   

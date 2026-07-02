@@ -1,8 +1,0 @@
-1.工艺流程分析
-     1.参数下发完成后，进行条码出入站管理（根据工艺路线）
-	 上传的条码是放置在PLC db块,启用监听程序监听该地址对应的标志位，标志位地址信息通过StationCode在PLC_StationBarcode表中取
-	 地址码：BarcodeFlagAddress，数据类型：BarcodeFlagAddressType,当监听到该地址码变化为true时，我们会触发对应事件逻辑，取标志码对应的主表PLC_StationBarcode
-	 和子表PLC_BarcodePart然后进行读取，
-	 读取到的条码会进行校验，根据工艺路线获取当前工站所需要的物料信息，比如说，主零件，第一子零件，第二子零件，并且是启用状态，
-	 然后获取PLC_BarcodePart子表数据，通过工艺路线主零件名或者第一子零件名、第二子零件名等，监听对应的子零件标志位，如果监听位为true，就读取对应子零件条码，
-	 然后拿这个子零件条码进行校验，逻辑待开发，验证完成后，对应子零件BarcodeResetAddressType地址 写true，所有子零件验证完成后，会给主零件的BarcodeResetAddressType的true,如果验证不通过会写false
