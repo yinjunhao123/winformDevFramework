@@ -5,7 +5,7 @@ using System.Diagnostics;
 using System.Linq;
 using Microsoft.Extensions.Logging;
 
-namespace WinformDevFramework.Services.PLCBasic
+namespace WinformDevFramework.Services
 {
     /// <summary>
     /// 性能日志记录器
@@ -58,7 +58,7 @@ namespace WinformDevFramework.Services.PLCBasic
                             // 时间类指标：超过阈值才记录
                             if (longValue > 100)
                             {
-                                _logger.LogDebug($"[性能指标] {serviceName}.{metricName} = {longValue}ms");
+                               // _logger.LogDebug($"[性能指标] {serviceName}.{metricName} = {longValue}ms");
                             }
                         }
                         else if (metricName.EndsWith("Count") || metricName.EndsWith("Total"))
@@ -80,7 +80,7 @@ namespace WinformDevFramework.Services.PLCBasic
             catch (Exception ex)
             {
                 // 性能日志记录失败不影响主流程
-                global::System.Diagnostics.Debug.WriteLine($"[PerformanceLogger] 记录性能指标失败: {ex.Message}");
+                Debug.WriteLine($"[PerformanceLogger] 记录性能指标失败: {ex.Message}");
             }
         }
 

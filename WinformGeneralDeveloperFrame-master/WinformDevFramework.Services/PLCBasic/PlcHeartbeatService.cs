@@ -226,7 +226,7 @@ namespace WinformDevFramework.Services.PLCBasic
         private void HeartbeatLoop()
         {
             long loopCount = 0;
-            _logger.LogInformation("[心跳服务] 心跳检测线程已启动，间隔: {_intervalMs}ms");
+            _logger.LogInformation($"[心跳服务] 心跳检测线程已启动，间隔: {_intervalMs}ms");
 
             while (_isRunning)
             {

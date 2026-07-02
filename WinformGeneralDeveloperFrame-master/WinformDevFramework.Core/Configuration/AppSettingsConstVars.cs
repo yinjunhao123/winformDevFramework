@@ -21,24 +21,24 @@ namespace WinformDevFramework.Core.Configuration
         /// </summary>
         public static readonly string DbDbType = AppSettingsHelper.GetContent("ConnectionStrings", "DbType");
 
-        /// <summary>
-        /// 自动更新开关
-        /// </summary>
-        public static readonly bool AtuoUpdate =
-            bool.Parse(AppSettingsHelper.GetContent("Update", "AtuoUpdate").ToLower().Equals("true")
-                ? "true"
-                : "false");
+        ///// <summary>
+        ///// 自动更新开关
+        ///// </summary>
+        //public static readonly bool AtuoUpdate =
+        //    bool.Parse(AppSettingsHelper.GetContent("Update", "AtuoUpdate").ToLower().Equals("true")
+        //        ? "true"
+        //        : "false");
 
-        /// <summary>
-        /// 版本号
-        /// </summary>
-        public static readonly string Version = AppSettingsHelper.GetContent("Update", "Version");
+        ///// <summary>
+        ///// 版本号
+        ///// </summary>
+        //public static readonly string Version = AppSettingsHelper.GetContent("Update", "Version");
 
-        /// <summary>
-        /// 更新服务器地址
-        /// </summary>
+        ///// <summary>
+        ///// 更新服务器地址
+        ///// </summary>
 
-        public static readonly string Url = AppSettingsHelper.GetContent("Update", "Url");
+        //public static readonly string Url = AppSettingsHelper.GetContent("Update", "Url");
 
         /// <summary>
         /// 跳动IP

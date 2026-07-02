@@ -5,8 +5,8 @@ namespace PLCBasic
     [SugarTable("WipProcessData")]
     public class WipProcessData
     {
-        [SugarColumn(IsPrimaryKey = true)]
-        public string Id { get; set; }
+        [SugarColumn(IsPrimaryKey = true, IsIdentity = true)]
+        public int Id { get; set; }
 
         /// <summary>
         /// 型号
