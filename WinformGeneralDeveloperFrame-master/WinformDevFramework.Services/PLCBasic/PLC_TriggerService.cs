@@ -4130,7 +4130,7 @@ namespace WinformDevFramework.Services.PLCBasic
             };
 
             await WriteDataPointsToPlc(plcCode, writeDataPoints, dataToWrite);
-            _logger.LogWarning($"向PLC下发错误状态: DataSaveDone=true, DataSaveNG=true, DataSaveErrCode={errorCode}, DataSaveErrMsg={errorMsg}");
+            _logger.LogWarning($"向PLC下发错误状态: DataSaveDone=true, DataSaveNG=true, DataSaveErrCode={errorCode}");
         }
     }
 }
